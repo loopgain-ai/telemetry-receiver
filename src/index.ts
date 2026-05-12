@@ -134,9 +134,10 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
   const ts = parseTimestampHour(payload.timestamp_hour);
   if (ts === null) return json({ error: "invalid_timestamp_hour" }, 400);
 
-  const now = Math.floor(Date.now() / 1000);
   const summary = payload.loop.convergence_profile_summary;
 
+  // received_at is omitted from the column list; the schema's
+  // `DEFAULT (unixepoch())` fills it. 18 columns, 18 bound values.
   await env.DB.prepare(
     `INSERT INTO loop_events (
       customer_id, workload_id, timestamp_hour, library_version,
@@ -144,8 +145,8 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       rollback_triggered, profile_min, profile_max, profile_median,
       profile_samples, threshold_fast_converge, threshold_converging,
       threshold_stalling, threshold_oscillating_upper,
-      smoothing_window, received_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      smoothing_window
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       customerId,
