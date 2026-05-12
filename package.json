@@ -1,0 +1,25 @@
+{
+  "name": "loopgain-telemetry-receiver",
+  "version": "0.1.0",
+  "description": "Cloudflare Worker that ingests anonymized telemetry from the loopgain library and serves the dashboard.",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "db:create": "wrangler d1 create loopgain-telemetry",
+    "db:schema:remote": "wrangler d1 execute loopgain-telemetry --file=./schema.sql --remote",
+    "db:schema:local": "wrangler d1 execute loopgain-telemetry --file=./schema.sql --local",
+    "issue-token": "node scripts/issue-token.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^3.78.0"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/loopgain-ai/telemetry-receiver"
+  }
+}

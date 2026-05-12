@@ -1,0 +1,20 @@
+name = "loopgain-telemetry-receiver"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 database binding — fill in `database_id` after running:
+#   wrangler d1 create loopgain-telemetry
+[[d1_databases]]
+binding = "DB"
+database_name = "loopgain-telemetry"
+database_id = "<RUN_wrangler_d1_create_TO_GET_THIS_ID>"
+
+# Optional: custom domain. Set up loopgain.ai DNS to route
+# telemetry.loopgain.ai → this worker.
+# [[routes]]
+# pattern = "telemetry.loopgain.ai/*"
+# zone_name = "loopgain.ai"
+
+[observability]
+enabled = true
