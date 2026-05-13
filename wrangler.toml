@@ -8,13 +8,13 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "loopgain-telemetry"
-database_id = "<RUN_wrangler_d1_create_TO_GET_THIS_ID>"
+database_id = "1a641701-ac8b-4f7d-a24c-753f877aa36f"
 
-# Optional: custom domain. Set up loopgain.ai DNS to route
-# telemetry.loopgain.ai → this worker.
-# [[routes]]
-# pattern = "telemetry.loopgain.ai/*"
-# zone_name = "loopgain.ai"
+# Custom domain. Added via dashboard 2026-05-12; declared here so future
+# `wrangler deploy` runs re-apply the route if it's ever cleared.
+[[routes]]
+pattern = "telemetry.loopgain.ai/*"
+zone_name = "loopgain.ai"
 
 [observability]
 enabled = true

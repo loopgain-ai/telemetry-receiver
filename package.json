@@ -1,21 +1,24 @@
 {
   "name": "loopgain-telemetry-receiver",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cloudflare Worker that ingests anonymized telemetry from the loopgain library and serves the dashboard.",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit",
     "db:create": "wrangler d1 create loopgain-telemetry",
     "db:schema:remote": "wrangler d1 execute loopgain-telemetry --file=./schema.sql --remote",
     "db:schema:local": "wrangler d1 execute loopgain-telemetry --file=./schema.sql --local",
+    "db:migrate:0002:remote": "wrangler d1 execute loopgain-telemetry --file=./migrations/0002_eta_calibration.sql --remote",
+    "db:migrate:0002:local": "wrangler d1 execute loopgain-telemetry --file=./migrations/0002_eta_calibration.sql --local",
     "issue-token": "node scripts/issue-token.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240909.0",
     "typescript": "^5.5.0",
-    "wrangler": "^3.78.0"
+    "wrangler": "^4.90.1"
   },
   "license": "Apache-2.0",
   "repository": {
