@@ -94,8 +94,8 @@ npm run issue-token -- --name "test-account" --local
 Output:
 
 ```
-Customer ID:  cust_a3f5b9c2d18e4710
-Bearer Token: lgk_7tWf3rE9xN4PqL6KvY8mZcD1bH2GsR0a
+Customer ID:  cust_<16-hex-chars>
+Bearer Token: lgk_<32-char-base64url>   # shown ONCE; never re-derivable
 ```
 
 Hand the bearer token to the customer; they configure it in their library call:
