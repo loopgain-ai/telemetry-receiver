@@ -8,10 +8,20 @@
  * Prints the customer_id and the plain-text token. The plain token is shown
  * ONCE and never stored — only its SHA-256 hash is persisted in the DB.
  * Hand the token to the customer; they put it in their `LoopGain.send_telemetry(token=...)`.
+ *
+ * Hardening notes:
+ *   - SQL is written to a temp file and executed via `wrangler d1 execute --file`.
+ *     No string interpolation into a shell command line; no shell injection
+ *     surface even if --name / --email contain quotes, backslashes, or
+ *     shell metacharacters.
+ *   - The temp file lives in an mkdtemp directory and is removed after.
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -31,22 +41,37 @@ const token = `lgk_${randomBytes(24).toString("base64url")}`;
 const tokenHash = createHash("sha256").update(token).digest("hex");
 const createdAt = Math.floor(Date.now() / 1000);
 
+// SQL with single-quote-escaped string literals. Embedded into a .sql file
+// (no shell), so shell metachars in name/email are irrelevant. Single-quote
+// escaping (double them up) handles SQL-side correctness.
+function sqlEscape(s) {
+  return s.replace(/'/g, "''");
+}
 const sql = `INSERT INTO customers (customer_id, token_hash, name, contact_email, created_at)
-  VALUES ('${customerId}', '${tokenHash}', '${name.replace(/'/g, "''")}',
-          '${email.replace(/'/g, "''")}', ${createdAt});`;
+  VALUES ('${customerId}', '${tokenHash}', '${sqlEscape(name)}',
+          '${sqlEscape(email)}', ${createdAt});\n`;
 
-const cmd = [
-  "wrangler",
-  "d1",
-  "execute",
-  "loopgain-telemetry",
-  local ? "--local" : "--remote",
-  "--command",
-  `"${sql}"`,
-].join(" ");
+const dir = mkdtempSync(join(tmpdir(), "loopgain-issue-"));
+const sqlPath = join(dir, "insert.sql");
 
 console.log(`Issuing token for "${name}"...`);
-execSync(cmd, { stdio: "inherit" });
+
+try {
+  writeFileSync(sqlPath, sql, { encoding: "utf8", mode: 0o600 });
+  execFileSync(
+    "wrangler",
+    [
+      "d1",
+      "execute",
+      "loopgain-telemetry",
+      local ? "--local" : "--remote",
+      `--file=${sqlPath}`,
+    ],
+    { stdio: "inherit" },
+  );
+} finally {
+  rmSync(dir, { recursive: true, force: true });
+}
 
 console.log("");
 console.log("=".repeat(70));

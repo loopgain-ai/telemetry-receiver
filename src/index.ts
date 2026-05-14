@@ -11,16 +11,29 @@
  *
  * Routes:
  *   POST /v1/aggregate      Ingest one telemetry payload (from the library).
+ *                           Server-to-server only; browser-origin requests
+ *                           are rejected with 403.
  *   GET  /v1/stats          Aggregated stats for the bearer's customer (30d).
  *   GET  /v1/profiles       Convergence-profile events (optionally per-workload).
  *   GET  /v1/events         Recent loop events for the rollback log.
  *   GET  /v1/calibration    Converged loops with eta-prediction snapshots
  *                           (drives the ETA Accuracy dashboard panel).
- *   POST /v1/token/rotate   Rotate the caller's bearer token. Authenticates
- *                           with the *current* token; returns a new plain
- *                           token (shown once). The old token's hash is
- *                           replaced atomically — it stops working immediately.
- *   GET  /health            Liveness probe.
+ *   GET  /health            Liveness probe (public, no auth).
+ *
+ * Token rotation is intentionally *not* available over HTTP. Rotation
+ * happens only via the operator-side `scripts/rotate-token.mjs` script,
+ * which requires Cloudflare account access. This eliminates the
+ * "leaked-token can lock the owner out" blast radius.
+ *
+ * CORS is locked down: only `https://dashboard.loopgain.ai` and a small
+ * set of localhost origins are allowed. `/v1/aggregate` does not accept
+ * browser-origin requests at all.
+ *
+ * Rate limiting is enforced via Cloudflare's first-party rate-limit
+ * bindings (see wrangler.toml). Two layers:
+ *   - per-IP across all routes (catches unauth abuse)
+ *   - per-customer on /v1/aggregate (ingestion ceiling per account)
+ *   - per-customer on read routes (dashboard polling ceiling)
  *
  * Schema versions:
  *   v1 — initial release.
@@ -29,8 +42,16 @@
  *        new fields, v2 stores the snapshot when the library captured one.
  */
 
+interface RateLimit {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+}
+
 export interface Env {
   DB: D1Database;
+  // First-party Cloudflare rate-limit bindings. Configured in wrangler.toml.
+  AUTH_RL: RateLimit;       // Per-IP across the whole Worker (unauth abuse).
+  AGGREGATE_RL: RateLimit;  // Per-customer on POST /v1/aggregate.
+  READ_RL: RateLimit;       // Per-customer on GET /v1/* read routes.
 }
 
 interface ProfileSummary {
@@ -70,17 +91,49 @@ interface TelemetryPayload {
 const SUPPORTED_SCHEMA_VERSIONS = [1, 2] as const;
 const CURRENT_SCHEMA_VERSION = 2;
 
-const CORS_HEADERS = {
+// CORS allow-list. Only these origins may make browser-origin requests to
+// the authenticated read endpoints. /v1/aggregate refuses browser-origin
+// requests entirely (see fetch()).
+const ALLOWED_ORIGINS = new Set<string>([
+  "https://dashboard.loopgain.ai",
+  "http://localhost:5173",
+  "http://localhost:4173",
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:4173",
+]);
+
+function corsHeaders(request: Request): Record<string, string> {
+  const origin = request.headers.get("Origin") ?? "";
+  const headers: Record<string, string> = {
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+  if (ALLOWED_ORIGINS.has(origin)) {
+    headers["Access-Control-Allow-Origin"] = origin;
+  }
+  return headers;
+}
+
+// /health and / are public and intentionally browseable from anywhere.
+const PUBLIC_CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
 };
 
 function json(body: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS, ...extraHeaders },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
   });
+}
+
+function withHeaders(resp: Response, headers: Record<string, string>): Response {
+  const out = new Response(resp.body, resp);
+  for (const [k, v] of Object.entries(headers)) out.headers.set(k, v);
+  return out;
 }
 
 async function sha256(input: string): Promise<string> {
@@ -91,33 +144,25 @@ async function sha256(input: string): Promise<string> {
     .join("");
 }
 
-function base64url(bytes: Uint8Array): string {
-  let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function generateToken(): string {
-  // Mirrors scripts/issue-token.mjs: 24 random bytes, base64url, "lgk_" prefix.
-  const bytes = new Uint8Array(24);
-  crypto.getRandomValues(bytes);
-  return `lgk_${base64url(bytes)}`;
-}
-
+// Constant-time-shaped auth: always compute SHA-256 and always run the DB
+// lookup, regardless of whether the Authorization header is present or
+// well-formed. The hash of the empty string is a well-known value that we
+// never insert into customers.token_hash, so a missing/empty bearer
+// resolves to "no row" via the same code path as a malformed bearer.
 async function authenticate(request: Request, env: Env): Promise<string | null> {
-  const auth = request.headers.get("Authorization");
-  if (!auth || !auth.startsWith("Bearer ")) return null;
-  const token = auth.slice(7).trim();
-  if (!token) return null;
-
+  const header = request.headers.get("Authorization") ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
   const tokenHash = await sha256(token);
   const row = await env.DB.prepare(
-    "SELECT customer_id FROM customers WHERE token_hash = ?"
+    "SELECT customer_id FROM customers WHERE token_hash = ?",
   )
     .bind(tokenHash)
     .first<{ customer_id: string }>();
-
   return row?.customer_id ?? null;
+}
+
+function clientIp(request: Request): string {
+  return request.headers.get("cf-connecting-ip") ?? "unknown";
 }
 
 function parseTimestampHour(iso: string): number | null {
@@ -166,8 +211,17 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
     return json({ error: "method_not_allowed" }, 405);
   }
 
+  // Server-to-server only. Browser-origin requests are rejected outright.
+  if (request.headers.get("Origin")) {
+    return json({ error: "browser_requests_not_allowed" }, 403);
+  }
+
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
+
+  // Per-customer ingestion ceiling.
+  const rl = await env.AGGREGATE_RL.limit({ key: customerId });
+  if (!rl.success) return json({ error: "rate_limited" }, 429);
 
   let parsed: unknown;
   try {
@@ -200,7 +254,7 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       profile_samples, threshold_fast_converge, threshold_converging,
       threshold_stalling, threshold_oscillating_upper,
       smoothing_window, first_eta_prediction, first_eta_at_iteration
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       customerId,
@@ -222,7 +276,7 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       payload.thresholds.oscillating_upper,
       payload.smoothing_window,
       firstEta,
-      firstEtaAt
+      firstEtaAt,
     )
     .run();
 
@@ -237,13 +291,16 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
 
+  const rl = await env.READ_RL.limit({ key: customerId });
+  if (!rl.success) return json({ error: "rate_limited" }, 429);
+
   const since = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
 
   const outcomeStats = await env.DB.prepare(
     `SELECT outcome, COUNT(*) AS count
        FROM loop_events
        WHERE customer_id = ? AND timestamp_hour >= ?
-       GROUP BY outcome`
+       GROUP BY outcome`,
   )
     .bind(customerId, since)
     .all();
@@ -254,7 +311,7 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
             COALESCE(SUM(savings_vs_fixed_cap), 0) AS total_savings,
             COALESCE(SUM(CASE WHEN rollback_triggered = 1 THEN 1 ELSE 0 END), 0) AS rollbacks
        FROM loop_events
-       WHERE customer_id = ? AND timestamp_hour >= ?`
+       WHERE customer_id = ? AND timestamp_hour >= ?`,
   )
     .bind(customerId, since)
     .first();
@@ -265,7 +322,7 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
        WHERE customer_id = ? AND timestamp_hour >= ?
        GROUP BY workload_id
        ORDER BY count DESC
-       LIMIT 50`
+       LIMIT 50`,
   )
     .bind(customerId, since)
     .all();
@@ -287,6 +344,9 @@ async function handleProfiles(request: Request, env: Env): Promise<Response> {
 
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
+
+  const rl = await env.READ_RL.limit({ key: customerId });
+  if (!rl.success) return json({ error: "rate_limited" }, 429);
 
   const url = new URL(request.url);
   const workloadId = url.searchParams.get("workload_id");
@@ -329,6 +389,9 @@ async function handleEvents(request: Request, env: Env): Promise<Response> {
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
 
+  const rl = await env.READ_RL.limit({ key: customerId });
+  if (!rl.success) return json({ error: "rate_limited" }, 429);
+
   const url = new URL(request.url);
   const rollbacksOnly = url.searchParams.get("rollbacks_only") === "true";
   const since = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
@@ -360,6 +423,9 @@ async function handleCalibration(request: Request, env: Env): Promise<Response> 
 
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
+
+  const rl = await env.READ_RL.limit({ key: customerId });
+  if (!rl.success) return json({ error: "rate_limited" }, 429);
 
   const url = new URL(request.url);
   const workloadId = url.searchParams.get("workload_id");
@@ -397,39 +463,6 @@ async function handleCalibration(request: Request, env: Env): Promise<Response> 
   });
 }
 
-async function handleTokenRotate(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "POST") {
-    return json({ error: "method_not_allowed" }, 405);
-  }
-
-  const customerId = await authenticate(request, env);
-  if (!customerId) return json({ error: "unauthorized" }, 401);
-
-  const newToken = generateToken();
-  const newHash = await sha256(newToken);
-  const rotatedAt = Math.floor(Date.now() / 1000);
-
-  // Atomic swap: the row's token_hash UNIQUE constraint is respected because
-  // the new hash is from 192 fresh random bits — collision is astronomically
-  // unlikely. The old token's hash is immediately gone; that bearer stops
-  // working on the next request.
-  const result = await env.DB.prepare(
-    "UPDATE customers SET token_hash = ?, last_seen_at = ? WHERE customer_id = ?",
-  )
-    .bind(newHash, rotatedAt, customerId)
-    .run();
-
-  if (!result.success || (result.meta?.changes ?? 0) === 0) {
-    return json({ error: "rotate_failed" }, 500);
-  }
-
-  return json({
-    customer_id: customerId,
-    token: newToken,
-    rotated_at: rotatedAt,
-  });
-}
-
 async function handleHealth(): Promise<Response> {
   return json({
     status: "ok",
@@ -441,30 +474,51 @@ async function handleHealth(): Promise<Response> {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    const url = new URL(request.url);
+
+    // Public liveness routes — no auth, permissive CORS.
+    if (url.pathname === "/health" || url.pathname === "/") {
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: PUBLIC_CORS_HEADERS });
+      }
+      return withHeaders(await handleHealth(), PUBLIC_CORS_HEADERS);
     }
 
-    const url = new URL(request.url);
+    // Per-IP rate limit applies to every authenticated route, including the
+    // 401 path — this is what prevents token-spray abuse from an unknown
+    // source. Done before any other work.
+    const ipRl = await env.AUTH_RL.limit({ key: clientIp(request) });
+    if (!ipRl.success) {
+      const resp = json({ error: "rate_limited" }, 429);
+      return withHeaders(resp, corsHeaders(request));
+    }
+
+    // CORS preflight for the restricted endpoints.
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
+    }
+
+    let resp: Response;
     switch (url.pathname) {
       case "/v1/aggregate":
+        // Server-to-server; no CORS headers attached (the library doesn't
+        // need them, and refusing them keeps the route invisible to browsers).
         return handleAggregate(request, env);
       case "/v1/stats":
-        return handleStats(request, env);
+        resp = await handleStats(request, env);
+        break;
       case "/v1/profiles":
-        return handleProfiles(request, env);
+        resp = await handleProfiles(request, env);
+        break;
       case "/v1/events":
-        return handleEvents(request, env);
+        resp = await handleEvents(request, env);
+        break;
       case "/v1/calibration":
-        return handleCalibration(request, env);
-      case "/v1/token/rotate":
-        return handleTokenRotate(request, env);
-      case "/health":
-      case "/":
-        return handleHealth();
+        resp = await handleCalibration(request, env);
+        break;
       default:
-        return json({ error: "not_found" }, 404);
+        resp = json({ error: "not_found" }, 404);
     }
+    return withHeaders(resp, corsHeaders(request));
   },
 };

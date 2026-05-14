@@ -18,3 +18,28 @@ zone_name = "loopgain.ai"
 
 [observability]
 enabled = true
+
+# First-party rate-limit bindings. `namespace_id` is an arbitrary integer
+# unique within this Worker; the configured limit/period applies per key
+# (the key is supplied at call time — see src/index.ts).
+#
+# AUTH_RL  — per-IP across all routes. Throttles unauth abuse / token spray.
+# AGGREGATE_RL — per-customer on POST /v1/aggregate. Caps ingestion volume.
+# READ_RL  — per-customer on GET /v1/* reads. Caps dashboard polling.
+[[unsafe.bindings]]
+name = "AUTH_RL"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+
+[[unsafe.bindings]]
+name = "AGGREGATE_RL"
+type = "ratelimit"
+namespace_id = "1002"
+simple = { limit = 60, period = 60 }
+
+[[unsafe.bindings]]
+name = "READ_RL"
+type = "ratelimit"
+namespace_id = "1003"
+simple = { limit = 120, period = 60 }
