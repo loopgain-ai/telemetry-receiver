@@ -57,8 +57,14 @@ npx wrangler deploy
 # → prints the worker URL, e.g. https://loopgain-telemetry-receiver.<your-account>.workers.dev
 
 # 6. (Optional) Map a custom subdomain.
-# In wrangler.toml, uncomment the [[routes]] block and set your zone.
-# In your DNS, add a CNAME: telemetry.loopgain.ai → <your-account>.workers.dev.
+# Prerequisite: the target domain is on Cloudflare (a zone in your account).
+# The bundled wrangler.toml has a [[routes]] block pre-set to
+# telemetry.loopgain.ai — edit both fields for your own deployment:
+#   pattern   = "your-host.example.com/*"
+#   zone_name = "example.com"
+# Then re-run `npx wrangler deploy`. Cloudflare provisions the route
+# automatically — no DNS CNAME needed (Workers routes attach by URL
+# pattern, not by hostname).
 ```
 
 ---
