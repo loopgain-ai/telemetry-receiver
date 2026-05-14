@@ -1,6 +1,6 @@
 {
   "name": "loopgain-telemetry-receiver",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Cloudflare Worker that ingests anonymized telemetry from the loopgain library and serves the dashboard.",
   "private": true,
   "scripts": {
@@ -13,6 +13,10 @@
     "db:schema:local": "wrangler d1 execute loopgain-telemetry --file=./schema.sql --local",
     "db:migrate:0002:remote": "wrangler d1 execute loopgain-telemetry --file=./migrations/0002_eta_calibration.sql --remote",
     "db:migrate:0002:local": "wrangler d1 execute loopgain-telemetry --file=./migrations/0002_eta_calibration.sql --local",
+    "db:migrate:0003:remote": "wrangler d1 execute loopgain-telemetry --file=./migrations/0003_schema_v3.sql --remote",
+    "db:migrate:0003:local": "wrangler d1 execute loopgain-telemetry --file=./migrations/0003_schema_v3.sql --local",
+    "db:migrate:0004:remote": "wrangler d1 execute loopgain-telemetry --file=./migrations/0004_alerts.sql --remote",
+    "db:migrate:0004:local": "wrangler d1 execute loopgain-telemetry --file=./migrations/0004_alerts.sql --local",
     "issue-token": "node scripts/issue-token.mjs",
     "rotate-token": "node scripts/rotate-token.mjs"
   },

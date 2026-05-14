@@ -1,4 +1,4 @@
--- LoopGain telemetry receiver D1 schema (v2).
+-- LoopGain telemetry receiver D1 schema (v3).
 --
 -- Fresh deploys: apply this file. Existing deploys: apply the migration
 -- under migrations/ instead.
@@ -10,6 +10,9 @@
 --   v1 (2026-05-12) — initial release.
 --   v2 (2026-05-13) — added first_eta_prediction + first_eta_at_iteration
 --                     for the ETA Accuracy dashboard panel.
+--   v3 (2026-05-14) — added per_iteration_data (JSON, capped at 256 entries)
+--                     for the Loop Detail scrubber, plus framework/loop_type/
+--                     team classification columns for dashboard filters.
 
 -- Customers and their bearer tokens.
 -- token_hash is the SHA-256 hex digest of the bearer token. The plain token
@@ -54,6 +57,18 @@ CREATE TABLE IF NOT EXISTS loop_events (
     -- (target_error=0, never-converging traces, etc.).
     first_eta_prediction INTEGER,
     first_eta_at_iteration INTEGER,
+    -- v3: per-iteration trajectories serialized as JSON
+    -- {convergence_profile: number[], error_history: number[],
+    --  truncated: boolean, cap: number}. Capped at 256 entries each in the
+    -- library before transmission, ~6 KB max. NULL on v1/v2 payloads or
+    -- when the library was asked to omit per-iteration data.
+    per_iteration_data TEXT,
+    -- v3: optional classification labels. Free-form opaque strings used
+    -- for filtering in the dashboard. framework is typically auto-stamped
+    -- by integration adapters ("langgraph", "crewai", etc.).
+    framework TEXT,
+    loop_type TEXT,
+    team TEXT,
     received_at INTEGER NOT NULL DEFAULT (unixepoch()),
     FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
 );
@@ -72,3 +87,54 @@ CREATE INDEX IF NOT EXISTS idx_loop_events_rollbacks
 CREATE INDEX IF NOT EXISTS idx_loop_events_calibration
     ON loop_events (customer_id, timestamp_hour DESC)
     WHERE outcome = 'converged' AND first_eta_prediction IS NOT NULL;
+
+-- ── Alerting (schema v3+) ─────────────────────────────────────────────
+--
+-- Customer-defined rules evaluated by a scheduled cron handler, with
+-- delivery audit trail. Predicate and filter are JSON for forward
+-- compatibility (new predicate types don't require migrations).
+
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    predicate TEXT NOT NULL,
+    filter TEXT,
+    window_seconds INTEGER NOT NULL,
+    cooldown_seconds INTEGER NOT NULL DEFAULT 600,
+    action_type TEXT NOT NULL,
+    action_url TEXT NOT NULL,
+    action_secret TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_fired_at INTEGER,
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_rules_customer
+    ON alert_rules (customer_id);
+
+CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled
+    ON alert_rules (enabled, last_fired_at)
+    WHERE enabled = 1;
+
+CREATE TABLE IF NOT EXISTS alert_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL,
+    customer_id TEXT NOT NULL,
+    fired_at INTEGER NOT NULL,
+    match_value REAL NOT NULL,
+    match_count INTEGER NOT NULL,
+    delivery_status TEXT NOT NULL,
+    delivery_status_code INTEGER,
+    delivery_error TEXT,
+    FOREIGN KEY (rule_id) REFERENCES alert_rules(id),
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_deliveries_customer_time
+    ON alert_deliveries (customer_id, fired_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_alert_deliveries_rule_time
+    ON alert_deliveries (rule_id, fired_at DESC);

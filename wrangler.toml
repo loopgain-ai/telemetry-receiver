@@ -19,6 +19,12 @@ zone_name = "loopgain.ai"
 [observability]
 enabled = true
 
+# Scheduled trigger for the alert evaluator. Runs once per minute and
+# evaluates every enabled alert_rule against the last `window_seconds` of
+# loop_events. See `scheduled` export in src/index.ts.
+[triggers]
+crons = ["* * * * *"]
+
 # First-party rate-limit bindings. `namespace_id` is an arbitrary integer
 # unique within this Worker; the configured limit/period applies per key
 # (the key is supplied at call time — see src/index.ts).
