@@ -129,6 +129,19 @@ const CURRENT_SCHEMA_VERSION = 3;
 // hand-crafted payloads that try to write very large blobs.
 const PER_ITERATION_RECEIVER_CAP = 1024;
 
+// Hard cap on /v1/aggregate request body. With per_iteration capped at
+// 1024 entries × ~12 bytes/number × 2 arrays ≈ 25 KB, plus all the
+// scalar fields, a healthy payload is well under 64 KB. 256 KB gives a
+// 10x ceiling without inviting D1-row bloat from authed-but-abusive
+// customers. Enforced before .json() to fail fast.
+const MAX_AGGREGATE_BODY_BYTES = 256 * 1024;
+
+// Length caps on opaque string fields in the payload. Type-checking alone
+// would let an authed customer write multi-MB strings into D1 rows.
+const MAX_LIBRARY_VERSION_LEN = 64;
+const MAX_OUTCOME_LEN = 64;
+const MAX_LABEL_LEN = 200; // workload_id, framework, loop_type, team
+
 // CORS allow-list. Only these origins may make browser-origin requests to
 // the authenticated read endpoints. /v1/aggregate refuses browser-origin
 // requests entirely (see fetch()).
@@ -164,7 +177,13 @@ const PUBLIC_CORS_HEADERS: Record<string, string> = {
 function json(body: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json", ...extraHeaders },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Control": "no-store",
+      "Referrer-Policy": "no-referrer",
+      ...extraHeaders,
+    },
   });
 }
 
@@ -220,11 +239,14 @@ function validatePayload(payload: unknown): payload is TelemetryPayload {
   ) {
     return false;
   }
-  if (typeof p.library !== "string") return false;
-  if (typeof p.library_version !== "string") return false;
-  if (typeof p.timestamp_hour !== "string") return false;
+  if (typeof p.library !== "string" || p.library.length > MAX_LABEL_LEN) return false;
+  if (typeof p.library_version !== "string" || p.library_version.length > MAX_LIBRARY_VERSION_LEN) return false;
+  if (typeof p.timestamp_hour !== "string" || p.timestamp_hour.length > 64) return false;
+  if (p.workload_id !== undefined && p.workload_id !== null) {
+    if (typeof p.workload_id !== "string" || p.workload_id.length > MAX_LABEL_LEN) return false;
+  }
   if (!p.loop || typeof p.loop !== "object") return false;
-  if (typeof p.loop.outcome !== "string") return false;
+  if (typeof p.loop.outcome !== "string" || p.loop.outcome.length > MAX_OUTCOME_LEN) return false;
   if (typeof p.loop.iterations_used !== "number") return false;
   if (typeof p.loop.rollback_triggered !== "boolean") return false;
   if (!p.loop.convergence_profile_summary) return false;
@@ -245,7 +267,9 @@ function validatePayload(payload: unknown): payload is TelemetryPayload {
   if (p.schema_version >= 3) {
     for (const k of ["framework", "loop_type", "team"] as const) {
       const v = p[k];
-      if (v !== undefined && v !== null && typeof v !== "string") return false;
+      if (v !== undefined && v !== null) {
+        if (typeof v !== "string" || v.length > MAX_LABEL_LEN) return false;
+      }
     }
     if (p.per_iteration !== undefined && p.per_iteration !== null) {
       const pit = p.per_iteration;
@@ -287,6 +311,17 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
   // Per-customer ingestion ceiling.
   const rl = await env.AGGREGATE_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
+
+  // Body-size cap. Fail fast before parsing JSON so a malformed-but-huge
+  // body doesn't burn CPU. Cloudflare's own ~100 MB ceiling is the only
+  // backstop otherwise.
+  const lenHeader = request.headers.get("Content-Length");
+  if (lenHeader !== null) {
+    const len = Number(lenHeader);
+    if (!Number.isFinite(len) || len < 0 || len > MAX_AGGREGATE_BODY_BYTES) {
+      return json({ error: "payload_too_large" }, 413);
+    }
+  }
 
   let parsed: unknown;
   try {
@@ -801,7 +836,17 @@ function validateFilter(f: unknown): f is AlertFilter {
 /** Reject obviously-private destinations to limit SSRF blast radius.
  *  Cloudflare Workers can't reach customer internal infra anyway, but a
  *  customer mis-pasting an internal URL would otherwise hammer their own
- *  egress. https-only is enforced on the public internet. */
+ *  egress. https-only is enforced on the public internet.
+ *
+ *  Coverage:
+ *    - scheme: only https
+ *    - IPv4 private/loopback/link-local: 10/8, 172.16/12, 192.168/16, 127/8, 0.0.0.0, 169.254/16
+ *    - IPv6 literals: refused entirely (loopback ::1, link-local fe80::,
+ *      ULA fc00::/7 — and any future special range without a per-range
+ *      check). Customers wanting an IPv6 webhook can use a hostname.
+ *    - Numeric-encoded IPv4 (e.g., http://2130706433/ → 127.0.0.1):
+ *      refused entirely. Hostnames that are pure decimal/hex are not
+ *      valid public hostnames anyway. */
 function validateActionUrl(raw: string): string | null {
   let u: URL;
   try {
@@ -811,12 +856,26 @@ function validateActionUrl(raw: string): string | null {
   }
   if (u.protocol !== "https:") return "https_required";
   const host = u.hostname.toLowerCase();
+
+  // IPv6 literals — URL parses them with surrounding brackets stripped by
+  // `hostname`. The reliable detection is "contains a colon", since no
+  // valid DNS hostname or IPv4 address contains one.
+  if (host.includes(":")) return "private_url_not_allowed";
+
+  // Numeric-only hostnames (decimal, hex, octal) can encode arbitrary IPv4
+  // addresses including private ranges. Reject outright — public hostnames
+  // are never purely numeric.
+  if (/^[0-9]+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) {
+    return "private_url_not_allowed";
+  }
+
   if (
     host === "localhost" ||
     host === "127.0.0.1" ||
     host === "0.0.0.0" ||
     host.endsWith(".local") ||
     host.startsWith("10.") ||
+    host.startsWith("127.") ||
     host.startsWith("192.168.") ||
     host.startsWith("169.254.") ||
     /^172\.(1[6-9]|2\d|3[01])\./.test(host)
@@ -1184,6 +1243,14 @@ async function deliverWebhook(
   result: EvaluationResult,
   firedAt: number,
 ): Promise<{ status: "sent" | "failed"; statusCode: number | null; error: string | null }> {
+  // Re-validate at fire time: rules persist, but validateActionUrl can
+  // evolve (e.g., a new private range added). A previously-permitted URL
+  // that now resolves to "private_url_not_allowed" is short-circuited
+  // here rather than fired.
+  const urlErr = validateActionUrl(rule.action_url);
+  if (urlErr) {
+    return { status: "failed", statusCode: null, error: `url_rejected:${urlErr}` };
+  }
   const predicate = JSON.parse(rule.predicate);
   const filter = rule.filter ? JSON.parse(rule.filter) : null;
   const payload = {

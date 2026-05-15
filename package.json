@@ -1,6 +1,6 @@
 {
   "name": "loopgain-telemetry-receiver",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Cloudflare Worker that ingests anonymized telemetry from the loopgain library and serves the dashboard.",
   "private": true,
   "scripts": {
