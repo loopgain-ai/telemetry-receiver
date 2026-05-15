@@ -1,6 +1,6 @@
 # loopgain-telemetry-receiver
 
-Cloudflare Worker that ingests anonymized telemetry from the [loopgain](https://github.com/loopgain-ai/loopgain) Python library and serves aggregated reads to the LoopGain dashboard.
+Cloudflare Worker that ingests anonymized telemetry from the [loopgain](https://github.com/loopgain-ai/loopgain) Python library and serves aggregated reads to the [LoopGain dashboard](https://github.com/loopgain-ai/dashboard).
 
 **Privacy contract** (enforced by the library at the source): only structural statistics are sent and stored — state transitions, Aβ summaries (min/max/median), gain margin, rollback flag, library version, optional opaque `workload_id`, threshold config. Never prompts, completions, error contents, output buffers, or any per-iteration Aβ.
 
@@ -10,13 +10,20 @@ Cloudflare Worker that ingests anonymized telemetry from the [loopgain](https://
 
 | Route | Method | Auth | Purpose |
 | --- | --- | --- | --- |
-| `/v1/aggregate` | POST | Bearer | Ingest a single telemetry payload (called by the library). |
-| `/v1/stats` | GET | Bearer | 30-day aggregate stats (outcome counts, totals, workload list). |
-| `/v1/profiles` | GET | Bearer | Convergence-profile events (optional `?workload_id=` and `?since_hours=` filters). |
-| `/v1/events` | GET | Bearer | Recent loop events (optional `?rollbacks_only=true`). |
+| `/v1/aggregate` | POST | Bearer | Ingest one telemetry payload (called by the library; server-to-server only — browser-origin requests are rejected). |
+| `/v1/stats` | GET | Bearer | 30-day aggregate stats (outcome counts, totals, distinct framework / loop_type / team values for filter dropdowns). |
+| `/v1/profiles` | GET | Bearer | Convergence-profile events. Optional `workload_id`, `since_hours`, `framework`, `loop_type`, `team` filters. |
+| `/v1/events` | GET | Bearer | Recent loop events. Optional `rollbacks_only=true` plus the same filter set. |
+| `/v1/calibration` | GET | Bearer | Converged loops with first-ETA-prediction snapshots (drives the ETA Accuracy panel). |
+| `/v1/event/:id` | GET | Bearer | Full detail for one event including per-iteration trajectories (drives Loop Detail scrubbing). |
+| `/v1/alerts/rules` | GET / POST | Bearer | List or create alert rules. |
+| `/v1/alerts/rules/:id` | PUT / DELETE | Bearer | Update or delete an alert rule. |
+| `/v1/alerts/deliveries` | GET | Bearer | Audit log of alert deliveries (recent first). |
 | `/health` | GET | none | Liveness probe. |
 
-All authenticated endpoints expect `Authorization: Bearer <token>`. Tokens are mapped to a `customer_id`; only that customer's data is returned.
+All authenticated routes expect `Authorization: Bearer <token>`. Tokens are mapped to a `customer_id`; only that customer's data is returned.
+
+A `scheduled` cron handler runs every minute and evaluates each enabled alert rule against the recent `loop_events` window, recording fires to `alert_deliveries`.
 
 ---
 
@@ -24,13 +31,21 @@ All authenticated endpoints expect `Authorization: Bearer <token>`. Tokens are m
 
 ```
 [loopgain library] --POST--> [Cloudflare Worker] --D1--> [loopgain-telemetry]
-                                     |
-                                     +--GET--> [LoopGain dashboard]
+                                     |                          ^
+                                     +--GET--> [dashboard]      |
+                                     |                          |
+                                     +--cron (1m)--> [alert evaluator]
 ```
 
-- **Worker**: stateless, edge-deployed, TypeScript. Auth + write + simple aggregated reads.
-- **D1**: SQLite at the edge. Two tables: `customers` (bearer-token → customer_id) and `loop_events` (immutable append-only events).
-- **No application server.** This is intentional — pre-scale, the operational footprint is one Worker + one D1 database.
+- **Worker**: stateless, edge-deployed, TypeScript. Auth + write + aggregated reads + alert evaluation.
+- **D1**: SQLite at the edge. Tables: `customers` (bearer-token → customer_id), `loop_events` (append-only event log), `alert_rules`, `alert_deliveries`.
+- **No application server.** Pre-scale, the operational footprint is one Worker + one D1 database.
+
+**Schema versions.** The receiver accepts payloads at schema v1, v2, and v3. v2 added `first_eta_prediction` + `first_eta_at_iteration`; v3 added per-iteration trajectory JSON plus optional `framework` / `loop_type` / `team` classification labels. Older payloads store NULL for newer fields.
+
+**Rate limiting.** Cloudflare first-party rate-limit bindings: per-IP across all routes (unauth abuse), per-customer on `/v1/aggregate` (ingestion ceiling), per-customer on read routes (dashboard polling ceiling). CORS locked to `dashboard.loopgain.ai` plus a small set of localhost origins; `/v1/aggregate` does not accept browser-origin requests at all.
+
+**Token rotation** is intentionally *not* available over HTTP. Rotation happens via the operator-side `scripts/rotate-token.mjs`, which requires Cloudflare account access — this eliminates the "leaked token can lock the owner out" blast radius.
 
 ---
 
@@ -85,9 +100,9 @@ npm run tail
 
 ---
 
-## Issuing a bearer token to a customer
+## Issuing a bearer token
 
-Tokens are issued via a one-liner script. The plain token is printed once; only its SHA-256 hash is stored.
+Tokens are issued via a one-liner. The plain token is printed once; only its SHA-256 hash is stored.
 
 ```bash
 # Production:
@@ -104,7 +119,7 @@ Customer ID:  cust_<16-hex-chars>
 Bearer Token: lgk_<32-char-base64url>   # shown ONCE; never re-derivable
 ```
 
-Hand the bearer token to the customer; they configure it in their library call:
+Hand the token to the customer; they configure it in their library call:
 
 ```python
 lg.send_telemetry(
@@ -114,24 +129,26 @@ lg.send_telemetry(
 )
 ```
 
-To rotate a token, issue a new one and `DELETE FROM customers WHERE customer_id = '...'` (or null out `token_hash`) when ready.
+To rotate, run `scripts/rotate-token.mjs` (or issue a fresh token and null out the previous `token_hash`).
 
 ---
 
 ## Schema
 
-See [`schema.sql`](./schema.sql) for the full DDL. Two tables:
+See [`schema.sql`](./schema.sql) for the full DDL. Four tables:
 
-- **`customers`**: `customer_id` (primary), `token_hash` (SHA-256 of bearer token), `name`, `contact_email`, `created_at`, `last_seen_at`.
-- **`loop_events`**: one row per loop run. Columns mirror the v1 telemetry payload: outcome, iterations_used, gain_margin, savings, rollback flag, profile_{min,max,median,samples}, threshold config, smoothing window, library_version, workload_id, timestamp_hour, received_at.
+- **`customers`** — `customer_id`, `token_hash` (SHA-256), `name`, `contact_email`, timestamps.
+- **`loop_events`** — one row per loop run. Columns mirror the telemetry payload across schema versions: outcome, iterations_used, gain_margin, savings, rollback flag, profile stats, threshold config, smoothing window, library_version, workload_id, timestamp_hour, received_at, plus the v2/v3 additions (eta snapshots, per-iteration JSON, framework / loop_type / team).
+- **`alert_rules`** — per-customer rule definitions (enabled flag, predicate JSON, filter JSON, window seconds, cooldown).
+- **`alert_deliveries`** — append-only fire log used by the dashboard's alert audit view.
 
-Indexes are tuned for the dashboard's two dominant query shapes: `(customer_id, timestamp_hour DESC)` for time-range scans and `(customer_id, workload_id, timestamp_hour DESC)` for per-workload drilldown.
+Indexes are tuned for the dashboard's dominant query shapes: `(customer_id, timestamp_hour DESC)` for time-range scans and `(customer_id, workload_id, timestamp_hour DESC)` for per-workload drilldown.
 
 ---
 
 ## Self-hosting
 
-The receiver is licensed under Apache-2.0. Customers who want to keep telemetry under their own control can fork or clone this repo, deploy to their own Cloudflare account, and point the library at their endpoint instead of `telemetry.loopgain.ai`:
+Apache-2.0. To keep telemetry under your own control: fork or clone, deploy to your own Cloudflare account, and point the library at your endpoint:
 
 ```python
 lg.send_telemetry(
