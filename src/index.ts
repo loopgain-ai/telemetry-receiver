@@ -71,7 +71,33 @@ export interface Env {
   AUTH_RL: RateLimit;       // Per-IP across the whole Worker (unauth abuse).
   AGGREGATE_RL: RateLimit;  // Per-customer on POST /v1/aggregate.
   READ_RL: RateLimit;       // Per-customer on GET /v1/* read routes.
+  PUBLIC_RL: RateLimit;     // Per-IP on /v1/public/benchmark/* (unauth bench view).
 }
+
+// Hardcoded customer_id for the public benchmark view served at
+// /v1/public/benchmark/*. Anyone can read this tenant's data unauth'd —
+// it's the canonical bench-run dataset published alongside
+// github.com/loopgain-ai/loopgain-bench. NO other tenant data is exposed
+// by the public routes; the customer_id is *not* taken from a parameter.
+const BENCH_CUSTOMER_ID = "cust_7931de9f766452ac";
+
+// CORS headers applied to every /v1/public/benchmark/* response. Cache-
+// Control is set per-response (see `publicCacheControl`) so we don't poison
+// the edge with an empty/transient response.
+const BENCH_PUBLIC_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+// 5-min edge cache is generous: the bench dataset is static (2,000 trials
+// from a one-shot bench run); the only reason to re-fetch is dashboard
+// reloads, and those benefit from cache hits. But: empty responses (no
+// rows yet, transient zero-state during an upload) MUST NOT be cached,
+// otherwise a viewer who lands during the upload window sees an empty
+// dashboard for the next 5 minutes.
+const BENCH_CACHE_OK = "public, max-age=300";
+const BENCH_CACHE_SKIP = "no-store";
 
 interface ProfileSummary {
   min: number | null;
@@ -119,6 +145,11 @@ interface TelemetryPayload {
   // v3 — optional. Per-iteration trajectories capped at 256 entries.
   // Stored as a JSON blob in loop_events.per_iteration_data.
   per_iteration?: PerIterationData | null;
+  // v3.1 — optional. Real measured $ saved on this trial when the caller
+  // has paired-baseline data (currently: the bench, which has B5/B10/B20
+  // costs alongside each LG run). Real customers don't populate it; the
+  // dashboard falls back to iter-count × $/iter extrapolation when NULL.
+  actual_dollars_saved?: number | null;
 }
 
 const SUPPORTED_SCHEMA_VERSIONS = [1, 2, 3] as const;
@@ -291,6 +322,11 @@ function validatePayload(payload: unknown): payload is TelemetryPayload {
         }
       }
     }
+    // v3.1 actual_dollars_saved: finite non-negative number, or null.
+    if (p.actual_dollars_saved !== undefined && p.actual_dollars_saved !== null) {
+      const v = p.actual_dollars_saved;
+      if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return false;
+    }
   }
   return true;
 }
@@ -351,9 +387,10 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
   const framework = payload.framework ?? null;
   const loopType = payload.loop_type ?? null;
   const team = payload.team ?? null;
+  const actualDollarsSaved = payload.actual_dollars_saved ?? null;
 
   // received_at is omitted from the column list; the schema's
-  // `DEFAULT (unixepoch())` fills it. 24 columns, 24 bound values.
+  // `DEFAULT (unixepoch())` fills it. 25 columns, 25 bound values.
   await env.DB.prepare(
     `INSERT INTO loop_events (
       customer_id, workload_id, timestamp_hour, library_version,
@@ -362,8 +399,9 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       profile_samples, threshold_fast_converge, threshold_converging,
       threshold_stalling, threshold_oscillating_upper,
       smoothing_window, first_eta_prediction, first_eta_at_iteration,
-      per_iteration_data, framework, loop_type, team
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      per_iteration_data, framework, loop_type, team,
+      actual_dollars_saved
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       customerId,
@@ -390,6 +428,7 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       framework,
       loopType,
       team,
+      actualDollarsSaved,
     )
     .run();
 
@@ -418,13 +457,14 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") {
     return json({ error: "method_not_allowed" }, 405);
   }
-
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
-
   const rl = await env.READ_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
+  return statsCore(env, customerId);
+}
 
+async function statsCore(env: Env, customerId: string): Promise<Response> {
   const since = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
 
   const outcomeStats = await env.DB.prepare(
@@ -440,7 +480,9 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
     `SELECT COUNT(*) AS event_count,
             COALESCE(SUM(iterations_used), 0) AS total_iterations,
             COALESCE(SUM(savings_vs_fixed_cap), 0) AS total_savings,
-            COALESCE(SUM(CASE WHEN rollback_triggered = 1 THEN 1 ELSE 0 END), 0) AS rollbacks
+            COALESCE(SUM(CASE WHEN rollback_triggered = 1 THEN 1 ELSE 0 END), 0) AS rollbacks,
+            SUM(actual_dollars_saved) AS total_actual_dollars_saved,
+            SUM(CASE WHEN actual_dollars_saved IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_savings
        FROM loop_events
        WHERE customer_id = ? AND timestamp_hour >= ?`,
   )
@@ -479,6 +521,47 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
     distinctValues("team"),
   ]);
 
+  // Tenant-wide aggregates of profile_max (Aβ proxy) and gain_margin.
+  // Dashboards previously computed these client-side from /v1/events, but
+  // that endpoint caps at LIMIT 500 ordered by timestamp DESC — a recency-
+  // biased sample. Surfacing them here means a tenant with thousands of
+  // events in window sees the real median, not a slice. SQLite/D1 has no
+  // PERCENTILE_CONT, so each percentile is a small CTE: median uses the
+  // standard "AVG of the two middle rows" trick (works for even+odd N);
+  // p99 / p10 use "smallest row past the cutoff fraction".
+  async function percentileAgg(column: "profile_max" | "gain_margin") {
+    // Aβ (profile_max) treats NULL as 0: a TARGET_MET-at-iter-1 trial has
+    // no per-iteration Aβ, but its loop behavior is "instantly stable" —
+    // semantically Aβ=0. Excluding those rows (the original behavior) made
+    // the median a statistic over the failure-mode subset only and pinned
+    // the bench gauge at ~1.0 even though 65% of trials converged on the
+    // first iter. gain_margin keeps IS NOT NULL because a NULL there means
+    // the metric wasn't computable, not that it was zero.
+    const vExpr = column === "profile_max" ? `COALESCE(profile_max, 0.0)` : column;
+    const nullFilter = column === "profile_max" ? "" : `AND ${column} IS NOT NULL`;
+    const r = await env.DB.prepare(
+      `WITH ordered AS (
+         SELECT ${vExpr} AS v,
+                ROW_NUMBER() OVER (ORDER BY ${vExpr}) AS rn,
+                COUNT(*) OVER () AS total
+           FROM loop_events
+          WHERE customer_id = ? AND timestamp_hour >= ?
+            ${nullFilter}
+       )
+       SELECT
+         (SELECT AVG(v) FROM ordered WHERE rn IN ((total+1)/2, (total+2)/2)) AS median,
+         (SELECT MIN(v) FROM ordered WHERE CAST(rn AS REAL)/total >= 0.99)  AS p99,
+         (SELECT MIN(v) FROM ordered WHERE CAST(rn AS REAL)/total >= 0.10)  AS p10`,
+    )
+      .bind(customerId, since)
+      .first<{ median: number | null; p99: number | null; p10: number | null }>();
+    return r;
+  }
+  const [abAgg, gmAgg] = await Promise.all([
+    percentileAgg("profile_max"),
+    percentileAgg("gain_margin"),
+  ]);
+
   return json({
     customer_id: customerId,
     window_days: 30,
@@ -489,6 +572,13 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
     frameworks,
     loop_types: loopTypes,
     teams,
+    // Tenant-wide percentile aggregates — see comment above.
+    aggregates: {
+      ab_median: abAgg?.median ?? null,
+      ab_p99: abAgg?.p99 ?? null,
+      gm_median: gmAgg?.median ?? null,
+      gm_p10: gmAgg?.p10 ?? null,
+    },
   });
 }
 
@@ -496,14 +586,18 @@ async function handleProfiles(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") {
     return json({ error: "method_not_allowed" }, 405);
   }
-
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
-
   const rl = await env.READ_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
+  return profilesCore(new URL(request.url), env, customerId);
+}
 
-  const url = new URL(request.url);
+async function profilesCore(
+  url: URL,
+  env: Env,
+  customerId: string,
+): Promise<Response> {
   const sinceParam = url.searchParams.get("since_hours");
   const since =
     Math.floor(Date.now() / 1000) -
@@ -536,14 +630,18 @@ async function handleEvents(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") {
     return json({ error: "method_not_allowed" }, 405);
   }
-
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
-
   const rl = await env.READ_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
+  return eventsCore(new URL(request.url), env, customerId);
+}
 
-  const url = new URL(request.url);
+async function eventsCore(
+  url: URL,
+  env: Env,
+  customerId: string,
+): Promise<Response> {
   const rollbacksOnly = url.searchParams.get("rollbacks_only") === "true";
   const since = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
 
@@ -570,14 +668,18 @@ async function handleCalibration(request: Request, env: Env): Promise<Response> 
   if (request.method !== "GET") {
     return json({ error: "method_not_allowed" }, 405);
   }
-
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
-
   const rl = await env.READ_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
+  return calibrationCore(new URL(request.url), env, customerId);
+}
 
-  const url = new URL(request.url);
+async function calibrationCore(
+  url: URL,
+  env: Env,
+  customerId: string,
+): Promise<Response> {
   const sinceParam = url.searchParams.get("since_hours");
   const since =
     Math.floor(Date.now() / 1000) -
@@ -618,13 +720,18 @@ async function handleEventDetail(
   if (request.method !== "GET") {
     return json({ error: "method_not_allowed" }, 405);
   }
-
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
-
   const rl = await env.READ_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
+  return eventDetailCore(env, customerId, idStr);
+}
 
+async function eventDetailCore(
+  env: Env,
+  customerId: string,
+  idStr: string,
+): Promise<Response> {
   const id = Number(idStr);
   if (!Number.isInteger(id) || id <= 0) {
     return json({ error: "invalid_event_id" }, 400);
@@ -683,6 +790,30 @@ export default {
         return new Response(null, { status: 204, headers: PUBLIC_CORS_HEADERS });
       }
       return withHeaders(await handleHealth(), PUBLIC_CORS_HEADERS);
+    }
+
+    // Public benchmark routes — no auth, wildcard CORS, edge-cacheable.
+    // Routed BEFORE the per-IP AUTH_RL so legitimate dashboard polls of
+    // /benchmark don't share the 60-rpm-per-IP authed-route bucket;
+    // PUBLIC_RL handles abuse here independently.
+    if (url.pathname.startsWith("/v1/public/benchmark/")) {
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: { ...BENCH_PUBLIC_HEADERS, "Cache-Control": BENCH_CACHE_OK },
+        });
+      }
+      const resp = await handlePublicBenchmark(request, env, url);
+      // Skip edge cache on empty / non-2xx responses so transient
+      // zero-state doesn't get pinned for 5 minutes. handlePublicBenchmark
+      // sets X-Bench-Empty: "1" on its empty-data path so we don't have to
+      // re-parse the body here.
+      const isOk = resp.status >= 200 && resp.status < 300;
+      const isEmpty = resp.headers.get("X-Bench-Empty") === "1";
+      const cache = isOk && !isEmpty ? BENCH_CACHE_OK : BENCH_CACHE_SKIP;
+      const out = withHeaders(resp, { ...BENCH_PUBLIC_HEADERS, "Cache-Control": cache });
+      out.headers.delete("X-Bench-Empty");
+      return out;
     }
 
     // Per-IP rate limit applies to every authenticated route, including the
@@ -968,18 +1099,7 @@ async function handleAlertRulesCollection(
   if (!rl.success) return json({ error: "rate_limited" }, 429);
 
   if (request.method === "GET") {
-    const result = await env.DB
-      .prepare(
-        `SELECT id, customer_id, name, enabled, predicate, filter,
-                window_seconds, cooldown_seconds, action_type, action_url,
-                action_secret, created_at, updated_at, last_fired_at
-           FROM alert_rules
-           WHERE customer_id = ?
-           ORDER BY id ASC`,
-      )
-      .bind(customerId)
-      .all<AlertRuleRow>();
-    return json({ rules: (result.results ?? []).map(ruleRowToWire) });
+    return alertRulesListCore(env, customerId);
   }
   if (request.method === "POST") {
     const count = await env.DB
@@ -1089,13 +1209,37 @@ async function handleAlertRuleItem(
   return json({ error: "method_not_allowed" }, 405);
 }
 
+async function alertRulesListCore(
+  env: Env,
+  customerId: string,
+): Promise<Response> {
+  const result = await env.DB
+    .prepare(
+      `SELECT id, customer_id, name, enabled, predicate, filter,
+              window_seconds, cooldown_seconds, action_type, action_url,
+              action_secret, created_at, updated_at, last_fired_at
+         FROM alert_rules
+         WHERE customer_id = ?
+         ORDER BY id ASC`,
+    )
+    .bind(customerId)
+    .all<AlertRuleRow>();
+  return json({ rules: (result.results ?? []).map(ruleRowToWire) });
+}
+
 async function handleAlertDeliveries(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
   const rl = await env.READ_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
+  return alertDeliveriesCore(env, customerId);
+}
 
+async function alertDeliveriesCore(
+  env: Env,
+  customerId: string,
+): Promise<Response> {
   const result = await env.DB
     .prepare(
       `SELECT d.id, d.rule_id, d.fired_at, d.match_value, d.match_count,
@@ -1110,6 +1254,76 @@ async function handleAlertDeliveries(request: Request, env: Env): Promise<Respon
     .bind(customerId)
     .all();
   return json({ deliveries: result.results });
+}
+
+// ── Public benchmark routes ──────────────────────────────────────────
+//
+// Read-only, unauth'd mirrors of the /v1/* read endpoints, scoped to the
+// hardcoded `BENCH_CUSTOMER_ID`. Rate-limited per IP via PUBLIC_RL;
+// responses get 5-min edge cache + `Access-Control-Allow-Origin: *`.
+// There is no parameter that selects a customer_id — the route family
+// always serves the same canonical bench tenant.
+
+async function handlePublicBenchmark(
+  request: Request,
+  env: Env,
+  url: URL,
+): Promise<Response> {
+  if (request.method !== "GET") {
+    return json({ error: "method_not_allowed" }, 405);
+  }
+  const rl = await env.PUBLIC_RL.limit({ key: clientIp(request) });
+  if (!rl.success) return json({ error: "rate_limited" }, 429);
+
+  const tail = url.pathname.slice("/v1/public/benchmark/".length);
+  // Strip query string from the routing decision; tail compares the path only.
+  let inner: Response;
+  if (tail === "stats") inner = await statsCore(env, BENCH_CUSTOMER_ID);
+  else if (tail === "profiles") inner = await profilesCore(url, env, BENCH_CUSTOMER_ID);
+  else if (tail === "events") inner = await eventsCore(url, env, BENCH_CUSTOMER_ID);
+  else if (tail === "calibration") inner = await calibrationCore(url, env, BENCH_CUSTOMER_ID);
+  else if (tail === "alerts/rules") inner = await alertRulesListCore(env, BENCH_CUSTOMER_ID);
+  else if (tail === "alerts/deliveries") inner = await alertDeliveriesCore(env, BENCH_CUSTOMER_ID);
+  else if (tail.startsWith("event/")) {
+    const idStr = tail.slice("event/".length);
+    inner = await eventDetailCore(env, BENCH_CUSTOMER_ID, idStr);
+  } else return json({ error: "not_found" }, 404);
+
+  // Sniff the response body for empty/zero-state. We do this here (not
+  // inside each core) so the authed path is untouched. Sentinel header is
+  // stripped by the outer wrapper before the response leaves the worker.
+  return await markIfEmpty(inner, tail);
+}
+
+/** Read the response body, decide if it's empty for caching purposes, and
+ *  return a fresh Response with X-Bench-Empty set when appropriate. The
+ *  outer caller maps that to Cache-Control: no-store so a transient zero-
+ *  state response doesn't poison the edge cache for 5 minutes. */
+async function markIfEmpty(resp: Response, tail: string): Promise<Response> {
+  if (resp.status < 200 || resp.status >= 300) {
+    return withHeaders(resp, { "X-Bench-Empty": "1" });
+  }
+  let isEmpty = false;
+  let body: unknown;
+  try {
+    body = await resp.clone().json();
+  } catch {
+    body = null;
+  }
+  if (body && typeof body === "object") {
+    const b = body as Record<string, unknown>;
+    if (tail === "stats") {
+      const totals = b.totals as { event_count?: number } | null;
+      isEmpty = !totals || (totals.event_count ?? 0) === 0;
+    } else if (tail === "profiles" || tail === "events" || tail === "calibration") {
+      isEmpty = !Array.isArray(b.events) || (b.events as unknown[]).length === 0;
+    } else if (tail === "alerts/rules") {
+      isEmpty = !Array.isArray(b.rules) || (b.rules as unknown[]).length === 0;
+    } else if (tail === "alerts/deliveries") {
+      isEmpty = !Array.isArray(b.deliveries) || (b.deliveries as unknown[]).length === 0;
+    }
+  }
+  return isEmpty ? withHeaders(resp, { "X-Bench-Empty": "1" }) : resp;
 }
 
 // ── Cron evaluator ────────────────────────────────────────────────────

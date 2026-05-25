@@ -13,6 +13,8 @@
 --   v3 (2026-05-14) — added per_iteration_data (JSON, capped at 256 entries)
 --                     for the Loop Detail scrubber, plus framework/loop_type/
 --                     team classification columns for dashboard filters.
+--   v3.1 (2026-05-25) — added actual_dollars_saved (REAL, nullable) for
+--                       tenants with paired-baseline cost data (bench).
 
 -- Customers and their bearer tokens.
 -- token_hash is the SHA-256 hex digest of the bearer token. The plain token
@@ -69,6 +71,11 @@ CREATE TABLE IF NOT EXISTS loop_events (
     framework TEXT,
     loop_type TEXT,
     team TEXT,
+    -- v3.1: actual measured $ saved on this trial, populated only by
+    -- tenants with paired-baseline cost data (currently: the bench).
+    -- Real customers leave this NULL and the dashboard falls back to
+    -- iter-count × $/iter extrapolation.
+    actual_dollars_saved REAL,
     received_at INTEGER NOT NULL DEFAULT (unixepoch()),
     FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
 );
