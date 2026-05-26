@@ -15,6 +15,10 @@
 --                     team classification columns for dashboard filters.
 --   v3.1 (2026-05-25) — added actual_dollars_saved (REAL, nullable) for
 --                       tenants with paired-baseline cost data (bench).
+--   v3.2 (2026-05-26) — added actual_dollars_spent (REAL, nullable),
+--                       companion to actual_dollars_saved. Together they
+--                       drive the Waste panel's fully-measured math
+--                       without per-tenant special-casing in the dashboard.
 
 -- Customers and their bearer tokens.
 -- token_hash is the SHA-256 hex digest of the bearer token. The plain token
@@ -76,6 +80,12 @@ CREATE TABLE IF NOT EXISTS loop_events (
     -- Real customers leave this NULL and the dashboard falls back to
     -- iter-count × $/iter extrapolation.
     actual_dollars_saved REAL,
+    -- v3.2: actual measured $ spent on this trial (the LG-side cost).
+    -- Same population semantics as actual_dollars_saved — populated by
+    -- tenants with real per-run cost data, NULL otherwise. Lets the
+    -- Waste panel show measured spend alongside measured savings instead
+    -- of falling back to iter × $/iter extrapolation.
+    actual_dollars_spent REAL,
     received_at INTEGER NOT NULL DEFAULT (unixepoch()),
     FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
 );

@@ -150,6 +150,10 @@ interface TelemetryPayload {
   // costs alongside each LG run). Real customers don't populate it; the
   // dashboard falls back to iter-count × $/iter extrapolation when NULL.
   actual_dollars_saved?: number | null;
+  // v3.2 — optional. Real measured $ spent on this trial (LG-side cost).
+  // Companion to actual_dollars_saved; same population semantics. Lets
+  // the Waste panel show measured spend instead of iter × $/iter extrap.
+  actual_dollars_spent?: number | null;
 }
 
 const SUPPORTED_SCHEMA_VERSIONS = [1, 2, 3] as const;
@@ -327,6 +331,11 @@ function validatePayload(payload: unknown): payload is TelemetryPayload {
       const v = p.actual_dollars_saved;
       if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return false;
     }
+    // v3.2 actual_dollars_spent: finite non-negative number, or null.
+    if (p.actual_dollars_spent !== undefined && p.actual_dollars_spent !== null) {
+      const v = p.actual_dollars_spent;
+      if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return false;
+    }
   }
   return true;
 }
@@ -388,9 +397,10 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
   const loopType = payload.loop_type ?? null;
   const team = payload.team ?? null;
   const actualDollarsSaved = payload.actual_dollars_saved ?? null;
+  const actualDollarsSpent = payload.actual_dollars_spent ?? null;
 
   // received_at is omitted from the column list; the schema's
-  // `DEFAULT (unixepoch())` fills it. 25 columns, 25 bound values.
+  // `DEFAULT (unixepoch())` fills it. 26 columns, 26 bound values.
   await env.DB.prepare(
     `INSERT INTO loop_events (
       customer_id, workload_id, timestamp_hour, library_version,
@@ -400,8 +410,8 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       threshold_stalling, threshold_oscillating_upper,
       smoothing_window, first_eta_prediction, first_eta_at_iteration,
       per_iteration_data, framework, loop_type, team,
-      actual_dollars_saved
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      actual_dollars_saved, actual_dollars_spent
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       customerId,
@@ -429,6 +439,7 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       loopType,
       team,
       actualDollarsSaved,
+      actualDollarsSpent,
     )
     .run();
 
@@ -499,7 +510,9 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
             COALESCE(SUM(savings_vs_fixed_cap), 0) AS total_savings,
             COALESCE(SUM(CASE WHEN rollback_triggered = 1 THEN 1 ELSE 0 END), 0) AS rollbacks,
             SUM(actual_dollars_saved) AS total_actual_dollars_saved,
-            SUM(CASE WHEN actual_dollars_saved IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_savings
+            SUM(CASE WHEN actual_dollars_saved IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_savings,
+            SUM(actual_dollars_spent) AS total_actual_dollars_spent,
+            SUM(CASE WHEN actual_dollars_spent IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_spend
        FROM loop_events
        WHERE customer_id = ? AND timestamp_hour >= ?`,
   )
