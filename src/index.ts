@@ -453,6 +453,23 @@ function classificationFilters(url: URL): { sql: string; binds: string[] } {
   return { sql: parts.join(" "), binds };
 }
 
+// Row-LIMIT helper for the list endpoints. Default is high enough that a
+// typical tenant gets every row in window; callers can override down (to
+// reduce payload) or up to MAX_ROW_LIMIT. Previously the limits were
+// hard-coded (500 on /v1/events, 1000 on /v1/profiles) which silently
+// truncated the dashboard's view of any tenant with more activity than
+// that — recency-biased and invisible to the UI. See Issue 1 in
+// RECEIVER_ACCURACY_FIXES_KICKOFF.md.
+const DEFAULT_ROW_LIMIT = 5000;
+const MAX_ROW_LIMIT = 50000;
+function parseRowLimit(url: URL): number {
+  const raw = url.searchParams.get("limit");
+  if (raw === null) return DEFAULT_ROW_LIMIT;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_ROW_LIMIT;
+  return Math.min(n, MAX_ROW_LIMIT);
+}
+
 async function handleStats(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") {
     return json({ error: "method_not_allowed" }, 405);
@@ -495,7 +512,7 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
        WHERE customer_id = ? AND timestamp_hour >= ?
        GROUP BY workload_id
        ORDER BY count DESC
-       LIMIT 50`,
+       LIMIT 5000`,
   )
     .bind(customerId, since)
     .all();
@@ -530,23 +547,22 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
   // standard "AVG of the two middle rows" trick (works for even+odd N);
   // p99 / p10 use "smallest row past the cutoff fraction".
   async function percentileAgg(column: "profile_max" | "gain_margin") {
-    // Aβ (profile_max) treats NULL as 0: a TARGET_MET-at-iter-1 trial has
-    // no per-iteration Aβ, but its loop behavior is "instantly stable" —
-    // semantically Aβ=0. Excluding those rows (the original behavior) made
-    // the median a statistic over the failure-mode subset only and pinned
-    // the bench gauge at ~1.0 even though 65% of trials converged on the
-    // first iter. gain_margin keeps IS NOT NULL because a NULL there means
-    // the metric wasn't computable, not that it was zero.
-    const vExpr = column === "profile_max" ? `COALESCE(profile_max, 0.0)` : column;
-    const nullFilter = column === "profile_max" ? "" : `AND ${column} IS NOT NULL`;
+    // Both columns exclude NULL rows: a NULL profile_max means the loop
+    // converged at iter 1 (TARGET_MET) and never had Aβ measured, so it
+    // shouldn't anchor the median. A NULL gain_margin means the metric
+    // wasn't computable. The previous COALESCE(profile_max, 0.0) drove
+    // ab_median to 0 for any tenant with a meaningful fraction of
+    // TARGET_MET-at-iter-1 runs (see Issue 2 in
+    // RECEIVER_ACCURACY_FIXES_KICKOFF.md). The right framing is
+    // "median Aβ across runs that had measurable Aβ".
     const r = await env.DB.prepare(
       `WITH ordered AS (
-         SELECT ${vExpr} AS v,
-                ROW_NUMBER() OVER (ORDER BY ${vExpr}) AS rn,
+         SELECT ${column} AS v,
+                ROW_NUMBER() OVER (ORDER BY ${column}) AS rn,
                 COUNT(*) OVER () AS total
            FROM loop_events
           WHERE customer_id = ? AND timestamp_hour >= ?
-            ${nullFilter}
+            AND ${column} IS NOT NULL
        )
        SELECT
          (SELECT AVG(v) FROM ordered WHERE rn IN ((total+1)/2, (total+2)/2)) AS median,
@@ -561,6 +577,27 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
     percentileAgg("profile_max"),
     percentileAgg("gain_margin"),
   ]);
+
+  // Per-outcome aggregates over the full window. The dashboard's Waste
+  // "By outcome" breakdown previously extrapolated from the 500-row
+  // /v1/events sample (recency-biased + truncated); these fleet-wide
+  // sums let the panel render the real breakdown. iterations_avoided
+  // is the sum of savings_vs_fixed_cap (iters not run vs the worst-case
+  // fixed-cap baseline). actual_dollars_saved is summed only over rows
+  // where the library shipped a paired-baseline measurement.
+  const byOutcome = await env.DB.prepare(
+    `SELECT outcome,
+            COUNT(*) AS events,
+            COALESCE(SUM(iterations_used), 0) AS iterations_used,
+            COALESCE(SUM(savings_vs_fixed_cap), 0) AS iterations_avoided,
+            SUM(actual_dollars_saved) AS actual_dollars_saved
+       FROM loop_events
+       WHERE customer_id = ? AND timestamp_hour >= ?
+       GROUP BY outcome
+       ORDER BY events DESC`,
+  )
+    .bind(customerId, since)
+    .all();
 
   return json({
     customer_id: customerId,
@@ -578,6 +615,7 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
       ab_p99: abAgg?.p99 ?? null,
       gm_median: gmAgg?.median ?? null,
       gm_p10: gmAgg?.p10 ?? null,
+      by_outcome: byOutcome.results,
     },
   });
 }
@@ -607,6 +645,7 @@ async function profilesCore(
   // along with framework/loop_type/team. id is included so the dashboard can
   // open Loop Detail without re-deriving from (workload_id, timestamp_hour).
   const filters = classificationFilters(url);
+  const limit = parseRowLimit(url);
   const result = await env.DB.prepare(
     `SELECT id, timestamp_hour, workload_id, framework, loop_type, team,
             profile_min, profile_max, profile_median, profile_samples,
@@ -614,9 +653,9 @@ async function profilesCore(
        FROM loop_events
        WHERE customer_id = ? AND timestamp_hour >= ? ${filters.sql}
        ORDER BY timestamp_hour DESC
-       LIMIT 1000`,
+       LIMIT ?`,
   )
-    .bind(customerId, since, ...filters.binds)
+    .bind(customerId, since, ...filters.binds, limit)
     .all();
 
   return json({
@@ -647,6 +686,7 @@ async function eventsCore(
 
   const filters = classificationFilters(url);
   const rollbackClause = rollbacksOnly ? "AND rollback_triggered = 1" : "";
+  const limit = parseRowLimit(url);
   const result = await env.DB
     .prepare(
       `SELECT id, timestamp_hour, workload_id, framework, loop_type, team,
@@ -657,9 +697,9 @@ async function eventsCore(
          WHERE customer_id = ? AND timestamp_hour >= ?
            ${rollbackClause} ${filters.sql}
          ORDER BY timestamp_hour DESC
-         LIMIT 500`,
+         LIMIT ?`,
     )
-    .bind(customerId, since, ...filters.binds)
+    .bind(customerId, since, ...filters.binds, limit)
     .all();
   return json({ customer_id: customerId, events: result.results });
 }
