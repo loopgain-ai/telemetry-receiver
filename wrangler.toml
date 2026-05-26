@@ -49,3 +49,14 @@ name = "READ_RL"
 type = "ratelimit"
 namespace_id = "1003"
 simple = { limit = 120, period = 60 }
+
+# PUBLIC_RL — per-IP on /v1/public/benchmark/* (the unauth bench-view
+# routes). 120 rpm per IP gives the dashboard headroom for parallel
+# panel fetches on /benchmark while still throttling abuse from a
+# single source. Separate bucket from AUTH_RL so legitimate bench
+# viewers don't compete with the authed-route ceiling.
+[[unsafe.bindings]]
+name = "PUBLIC_RL"
+type = "ratelimit"
+namespace_id = "1004"
+simple = { limit = 120, period = 60 }
