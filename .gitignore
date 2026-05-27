@@ -5,3 +5,6 @@ dist/
 .env
 .env.*
 .DS_Store
+
+# planning/brainstorm session briefs — never commit
+*KICKOFF.md
