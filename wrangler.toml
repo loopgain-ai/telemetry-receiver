@@ -60,3 +60,14 @@ name = "PUBLIC_RL"
 type = "ratelimit"
 namespace_id = "1004"
 simple = { limit = 120, period = 60 }
+
+# FUNNEL_RL — per-IP on POST /v1/funnel (the unauth, anonymous funnel
+# ingest from the OSS library). A single install emits a handful of events
+# per session in batches every ~20s, so 120 rpm per IP is generous headroom
+# while still throttling abuse from a single source. Separate bucket from
+# AUTH_RL so anonymous funnel traffic never touches the authed-route ceiling.
+[[unsafe.bindings]]
+name = "FUNNEL_RL"
+type = "ratelimit"
+namespace_id = "1005"
+simple = { limit = 120, period = 60 }

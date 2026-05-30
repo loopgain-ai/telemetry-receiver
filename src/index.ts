@@ -13,6 +13,11 @@
  *   POST /v1/aggregate           Ingest one telemetry payload (from the library).
  *                                Server-to-server only; browser-origin requests
  *                                are rejected with 403.
+ *   POST /v1/funnel              Ingest a batch of ANONYMOUS funnel events from
+ *                                the OSS library's `loopgain.funnel` module.
+ *                                No auth, no bearer token, no IP stored —
+ *                                separate table from /v1/aggregate. See the
+ *                                "Funnel telemetry" section below.
  *   GET  /v1/stats               Aggregated stats for the bearer's customer (30d).
  *                                Includes distinct framework/loop_type/team values
  *                                used to populate dashboard filter dropdowns.
@@ -72,6 +77,7 @@ export interface Env {
   AGGREGATE_RL: RateLimit;  // Per-customer on POST /v1/aggregate.
   READ_RL: RateLimit;       // Per-customer on GET /v1/* read routes.
   PUBLIC_RL: RateLimit;     // Per-IP on /v1/public/benchmark/* (unauth bench view).
+  FUNNEL_RL: RateLimit;     // Per-IP on POST /v1/funnel (unauth anonymous funnel).
 }
 
 // Hardcoded customer_id for the public benchmark view served at
@@ -444,6 +450,229 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
     .run();
 
   return json({ status: "ok" }, 202);
+}
+
+// ── Funnel telemetry (anonymous, unauthenticated) ─────────────────────
+//
+// Completely separate ingest path from /v1/aggregate above. The product
+// route ships a *customer's own* loop data under *their* bearer token; this
+// route receives the *maintainer's* anonymous adoption-funnel events
+// (install → first observe() → recurring use) from the open-source library's
+// `loopgain.funnel` module. See loopgain-core/TELEMETRY.md for the contract.
+//
+// Privacy posture, enforced here:
+//   - NO bearer-token auth (the data is anonymous; there is no customer).
+//   - NO IP address is ever stored. The client IP is used only as an
+//     ephemeral per-IP rate-limit key in the router (FUNNEL_RL); it never
+//     reaches a D1 column.
+//   - Stored fields are anonymous counters only: a locally-generated random
+//     instance id (not derived from any identifier), hour-bucketed
+//     timestamps, library/python/os versions, adapter name, and coarse
+//     outcome counts.
+//
+// Batch shape (POST JSON):
+//   { schema_version: 1, library: "loopgain", events: [ {event}, ... ] }
+
+// Bumped only on a breaking change to the funnel event format. Mirrors
+// FUNNEL_SCHEMA_VERSION in loopgain.funnel; independent of the product
+// SUPPORTED_SCHEMA_VERSIONS above.
+const FUNNEL_SCHEMA_VERSION = 1;
+
+// A single install emits a handful of events per session, flushed in small
+// batches. 64 is well above any honest batch while bounding abuse.
+const MAX_FUNNEL_EVENTS = 64;
+
+// Funnel payloads are tiny (a few small JSON objects). 64 KB is a 10x+
+// ceiling; enforced before .json() so a huge body fails fast.
+const MAX_FUNNEL_BODY_BYTES = 64 * 1024;
+
+// instance_id is a uuid4().hex — exactly 32 hex chars. Validating the shape
+// keeps junk out of the install-counting column.
+const FUNNEL_INSTANCE_ID_RE = /^[0-9a-fA-F]{32}$/;
+
+// Length caps on the short opaque string fields (python, os, event, outcome
+// bucket names). Bounded so type-checking alone can't let a hostile caller
+// write multi-KB strings into rows.
+const MAX_FUNNEL_SHORT_LEN = 64;
+
+// Coarse outcome distribution has a small, stable key set
+// (converged / oscillating / diverged / stalled / max_iterations / other).
+// 16 leaves headroom for additive buckets without inviting blob bloat.
+const MAX_FUNNEL_OUTCOME_KEYS = 16;
+
+interface FunnelRow {
+  event: string;
+  instance_id: string;
+  ts_hour: number; // unix seconds, hour-bucketed
+  library_version: string;
+  python: string | null;
+  os: string | null;
+  adapter: string | null; // session events only, else NULL
+  session_seq: number | null; // session events only, else NULL
+  outcomes: string | null; // JSON, session events only, else NULL
+}
+
+// Optional bounded string: undefined/null → null; a too-long or non-string
+// value fails the whole event. Used for python / os / adapter.
+function optBoundedString(
+  v: unknown,
+  max: number,
+): { ok: boolean; value: string | null } {
+  if (v === undefined || v === null) return { ok: true, value: null };
+  if (typeof v !== "string" || v.length > max) return { ok: false, value: null };
+  return { ok: true, value: v };
+}
+
+// Optional coarse outcome map: { "converged": 3, "oscillating": 1, ... }.
+// Keys are short bucket names; values are non-negative integers. Serialized
+// to a JSON string for storage. undefined/null → null.
+function parseFunnelOutcomes(v: unknown): { ok: boolean; value: string | null } {
+  if (v === undefined || v === null) return { ok: true, value: null };
+  if (typeof v !== "object" || Array.isArray(v)) return { ok: false, value: null };
+  const obj = v as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (keys.length > MAX_FUNNEL_OUTCOME_KEYS) return { ok: false, value: null };
+  for (const k of keys) {
+    if (k.length > MAX_FUNNEL_SHORT_LEN) return { ok: false, value: null };
+    const n = obj[k];
+    if (typeof n !== "number" || !Number.isInteger(n) || n < 0) {
+      return { ok: false, value: null };
+    }
+  }
+  return { ok: true, value: JSON.stringify(obj) };
+}
+
+// Validate + normalize one funnel event into an insertable row, or null if
+// malformed. Type-strict on every field; permissive about which fields a
+// given event *name* carries (session-only fields are simply NULL on the
+// other event types) so additive event types stay forward-compatible.
+function parseFunnelEvent(raw: unknown): FunnelRow | null {
+  if (!raw || typeof raw !== "object") return null;
+  const e = raw as Record<string, unknown>;
+
+  if (
+    typeof e.event !== "string" ||
+    e.event.length === 0 ||
+    e.event.length > MAX_FUNNEL_SHORT_LEN
+  ) {
+    return null;
+  }
+  if (typeof e.instance_id !== "string" || !FUNNEL_INSTANCE_ID_RE.test(e.instance_id)) {
+    return null;
+  }
+  if (typeof e.ts_hour !== "string" || e.ts_hour.length > 64) return null;
+  const ts = parseTimestampHour(e.ts_hour);
+  if (ts === null) return null;
+  if (
+    typeof e.library_version !== "string" ||
+    e.library_version.length === 0 ||
+    e.library_version.length > MAX_LIBRARY_VERSION_LEN
+  ) {
+    return null;
+  }
+
+  const python = optBoundedString(e.python, MAX_FUNNEL_SHORT_LEN);
+  if (!python.ok) return null;
+  const os = optBoundedString(e.os, MAX_FUNNEL_SHORT_LEN);
+  if (!os.ok) return null;
+  const adapter = optBoundedString(e.adapter, MAX_LABEL_LEN);
+  if (!adapter.ok) return null;
+
+  let sessionSeq: number | null = null;
+  if (e.session_seq !== undefined && e.session_seq !== null) {
+    if (typeof e.session_seq !== "number" || !Number.isInteger(e.session_seq) || e.session_seq < 0) {
+      return null;
+    }
+    sessionSeq = e.session_seq;
+  }
+
+  const outcomes = parseFunnelOutcomes(e.outcomes);
+  if (!outcomes.ok) return null;
+
+  return {
+    event: e.event,
+    instance_id: e.instance_id,
+    ts_hour: ts,
+    library_version: e.library_version,
+    python: python.value,
+    os: os.value,
+    adapter: adapter.value,
+    session_seq: sessionSeq,
+    outcomes: outcomes.value,
+  };
+}
+
+// Validate the whole batch. The `library === "loopgain"` and
+// `schema_version === 1` guards are what reject a misdirected product
+// /v1/aggregate payload (which has neither an `events` array nor this
+// library/schema combination) from landing in the funnel table.
+function parseFunnelBatch(payload: unknown): { events: FunnelRow[] } | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  if (p.schema_version !== FUNNEL_SCHEMA_VERSION) return null;
+  if (p.library !== "loopgain") return null;
+  if (!Array.isArray(p.events)) return null;
+  if (p.events.length > MAX_FUNNEL_EVENTS) return null;
+
+  const out: FunnelRow[] = [];
+  for (const raw of p.events) {
+    const row = parseFunnelEvent(raw);
+    if (!row) return null;
+    out.push(row);
+  }
+  return { events: out };
+}
+
+async function handleFunnel(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") {
+    return json({ error: "method_not_allowed" }, 405);
+  }
+
+  // Body-size cap. Fail fast before parsing JSON.
+  const lenHeader = request.headers.get("Content-Length");
+  if (lenHeader !== null) {
+    const len = Number(lenHeader);
+    if (!Number.isFinite(len) || len < 0 || len > MAX_FUNNEL_BODY_BYTES) {
+      return json({ error: "payload_too_large" }, 413);
+    }
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = await request.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const batch = parseFunnelBatch(parsed);
+  if (!batch) return json({ error: "invalid_payload" }, 400);
+
+  // Insert one anonymous row per event. No customer_id, no IP — the table
+  // has no column for either, by design.
+  if (batch.events.length > 0) {
+    const stmt = env.DB.prepare(
+      `INSERT INTO funnel_events (
+        event, instance_id, ts_hour, library_version,
+        python, os, adapter, session_seq, outcomes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const statements = batch.events.map((e) =>
+      stmt.bind(
+        e.event,
+        e.instance_id,
+        e.ts_hour,
+        e.library_version,
+        e.python,
+        e.os,
+        e.adapter,
+        e.session_seq,
+        e.outcomes,
+      ),
+    );
+    await env.DB.batch(statements);
+  }
+
+  return json({ status: "ok", accepted: batch.events.length }, 202);
 }
 
 // ── Helper: build a classification-filter clause + bind values ────────
@@ -829,6 +1058,7 @@ async function handleHealth(): Promise<Response> {
     status: "ok",
     schema_version: CURRENT_SCHEMA_VERSION,
     supported_schema_versions: SUPPORTED_SCHEMA_VERSIONS,
+    funnel_schema_version: FUNNEL_SCHEMA_VERSION,
     service: "loopgain-telemetry-receiver",
   });
 }
@@ -867,6 +1097,18 @@ export default {
       const out = withHeaders(resp, { ...BENCH_PUBLIC_HEADERS, "Cache-Control": cache });
       out.headers.delete("X-Bench-Empty");
       return out;
+    }
+
+    // Anonymous funnel ingest — no auth, no bearer token, no CORS (it's a
+    // server-to-server POST from the library's funnel module, like
+    // /v1/aggregate). Routed BEFORE AUTH_RL so it uses its own per-IP bucket
+    // (FUNNEL_RL) and never competes with the authed-route ceiling. The IP is
+    // used here only as an ephemeral rate-limit key; it is NEVER stored —
+    // funnel telemetry is anonymous and the table has no IP column.
+    if (url.pathname === "/v1/funnel") {
+      const fRl = await env.FUNNEL_RL.limit({ key: clientIp(request) });
+      if (!fRl.success) return json({ error: "rate_limited" }, 429);
+      return handleFunnel(request, env);
     }
 
     // Per-IP rate limit applies to every authenticated route, including the

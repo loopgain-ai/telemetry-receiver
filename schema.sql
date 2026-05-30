@@ -19,6 +19,11 @@
 --                       companion to actual_dollars_saved. Together they
 --                       drive the Waste panel's fully-measured math
 --                       without per-tenant special-casing in the dashboard.
+--   v3.3 (2026-05-30) — added the funnel_events table for ANONYMOUS,
+--                       unauthenticated adoption-funnel telemetry from the
+--                       OSS library's loopgain.funnel module (POST /v1/funnel).
+--                       Entirely separate from loop_events: no customer_id,
+--                       no bearer token, no IP. See migration 0007.
 
 -- Customers and their bearer tokens.
 -- token_hash is the SHA-256 hex digest of the bearer token. The plain token
@@ -155,3 +160,38 @@ CREATE INDEX IF NOT EXISTS idx_alert_deliveries_customer_time
 
 CREATE INDEX IF NOT EXISTS idx_alert_deliveries_rule_time
     ON alert_deliveries (rule_id, fired_at DESC);
+
+-- ── Funnel telemetry (schema v3.3+) ───────────────────────────────────
+--
+-- ANONYMOUS, unauthenticated adoption-funnel events from the open-source
+-- library's `loopgain.funnel` module (POST /v1/funnel). This is a wholly
+-- separate path from loop_events above:
+--   - There is NO customer_id and NO bearer token — the data is anonymous.
+--   - There is NO IP column. Client IPs are never stored (the privacy
+--     contract in loopgain-core/TELEMETRY.md says IPs are never collected).
+--   - instance_id is a locally-generated random uuid4().hex — not derived
+--     from any hardware/user/network identifier — and exists only to avoid
+--     counting one install as many.
+-- Rows answer one question: install (first_init) → activate (first_observe)
+-- → retain (recurring session events), across the OSS userbase.
+CREATE TABLE IF NOT EXISTS funnel_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event TEXT NOT NULL,            -- "first_init" | "first_observe" | "session"
+    instance_id TEXT NOT NULL,      -- random uuid4().hex (anonymous, 32 hex)
+    ts_hour INTEGER NOT NULL,       -- unix seconds, hour-bucketed
+    library_version TEXT NOT NULL,
+    python TEXT,                    -- "3.12" etc. (major.minor only)
+    os TEXT,                        -- "Darwin" | "Linux" | "Windows"
+    adapter TEXT,                   -- session events only; "langgraph" etc. or NULL
+    session_seq INTEGER,            -- session events only; the install's session counter
+    outcomes TEXT,                  -- session events only; JSON coarse outcome counts
+    received_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+-- Count events of a type over time (install/activate/retain curves).
+CREATE INDEX IF NOT EXISTS idx_funnel_events_event_ts
+    ON funnel_events (event, ts_hour DESC);
+
+-- Group an install's events together (per-install funnel + retention).
+CREATE INDEX IF NOT EXISTS idx_funnel_events_instance
+    ON funnel_events (instance_id);

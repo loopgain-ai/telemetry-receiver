@@ -11,6 +11,7 @@ Cloudflare Worker that ingests anonymized telemetry from the [loopgain](https://
 | Route | Method | Auth | Purpose |
 | --- | --- | --- | --- |
 | `/v1/aggregate` | POST | Bearer | Ingest one telemetry payload (called by the library; server-to-server only — browser-origin requests are rejected). |
+| `/v1/funnel` | POST | **none** | Ingest a batch of **anonymous** adoption-funnel events from the library's `loopgain.funnel` module (install → first `observe()` → recurring use). Separate table from `/v1/aggregate`; no bearer token, no customer, **no IP stored**. |
 | `/v1/stats` | GET | Bearer | 30-day aggregate stats (outcome counts, totals, distinct framework / loop_type / team values for filter dropdowns). |
 | `/v1/profiles` | GET | Bearer | Convergence-profile events. Optional `workload_id`, `since_hours`, `framework`, `loop_type`, `team` filters. |
 | `/v1/events` | GET | Bearer | Recent loop events. Optional `rollbacks_only=true` plus the same filter set. |
@@ -43,7 +44,7 @@ A `scheduled` cron handler runs every minute and evaluates each enabled alert ru
 
 **Schema versions.** The receiver accepts payloads at schema v1, v2, and v3. v2 added `first_eta_prediction` + `first_eta_at_iteration`; v3 added per-iteration trajectory JSON plus optional `framework` / `loop_type` / `team` classification labels. Older payloads store NULL for newer fields.
 
-**Rate limiting.** Cloudflare first-party rate-limit bindings: per-IP across all routes (unauth abuse), per-customer on `/v1/aggregate` (ingestion ceiling), per-customer on read routes (dashboard polling ceiling). CORS locked to `dashboard.loopgain.ai` plus a small set of localhost origins; `/v1/aggregate` does not accept browser-origin requests at all.
+**Rate limiting.** Cloudflare first-party rate-limit bindings: per-IP across the authenticated routes (unauth abuse), per-customer on `/v1/aggregate` (ingestion ceiling), per-customer on read routes (dashboard polling ceiling), and a separate per-IP bucket on the unauthenticated `/v1/funnel` route so anonymous funnel traffic never touches the authed-route ceiling. CORS locked to `dashboard.loopgain.ai` plus a small set of localhost origins; `/v1/aggregate` does not accept browser-origin requests at all.
 
 **Token rotation** is intentionally *not* available over HTTP. Rotation happens via the operator-side `scripts/rotate-token.mjs`, which requires Cloudflare account access — this eliminates the "leaked token can lock the owner out" blast radius.
 
@@ -135,12 +136,13 @@ To rotate, run `scripts/rotate-token.mjs` (or issue a fresh token and null out t
 
 ## Schema
 
-See [`schema.sql`](./schema.sql) for the full DDL. Four tables:
+See [`schema.sql`](./schema.sql) for the full DDL. Five tables:
 
 - **`customers`** — `customer_id`, `token_hash` (SHA-256), `name`, `contact_email`, timestamps.
 - **`loop_events`** — one row per loop run. Columns mirror the telemetry payload across schema versions: outcome, iterations_used, gain_margin, savings, rollback flag, profile stats, threshold config, smoothing window, library_version, workload_id, timestamp_hour, received_at, plus the v2/v3 additions (eta snapshots, per-iteration JSON, framework / loop_type / team).
 - **`alert_rules`** — per-customer rule definitions (enabled flag, predicate JSON, filter JSON, window seconds, cooldown).
 - **`alert_deliveries`** — append-only fire log used by the dashboard's alert audit view.
+- **`funnel_events`** — anonymous adoption-funnel events from `/v1/funnel` (`loopgain.funnel`). One row per event (`first_init` / `first_observe` / `session`): random `instance_id`, hour-bucketed `ts_hour`, library/python/os versions, adapter, session_seq, coarse outcome counts. **No `customer_id`, no token, no IP** — wholly separate from the product tables.
 
 Indexes are tuned for the dashboard's dominant query shapes: `(customer_id, timestamp_hour DESC)` for time-range scans and `(customer_id, workload_id, timestamp_hour DESC)` for per-workload drilldown.
 
