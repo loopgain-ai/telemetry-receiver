@@ -242,6 +242,24 @@ async function sha256(input: string): Promise<string> {
     .join("");
 }
 
+// HMAC-SHA256 of `message` keyed by `secret`, lowercase-hex encoded. Used to
+// sign outbound alert webhooks (see deliverWebhook) so a customer's webhook
+// endpoint can verify a delivery genuinely came from the receiver and wasn't
+// forged by anyone who happened to learn the (customer-controlled) URL.
+async function hmacSha256Hex(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 // Constant-time-shaped auth: always compute SHA-256 and always run the DB
 // lookup, regardless of whether the Authorization header is present or
 // well-formed. The hash of the empty string is a well-known value that we
@@ -1771,14 +1789,29 @@ async function deliverWebhook(
     match_value: result.matchValue,
     match_count: result.matchCount,
   };
+  // Serialize once so the bytes we sign are exactly the bytes we send.
+  const body = JSON.stringify(payload);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "User-Agent": "loopgain-alerts/1.0",
+  };
+  // If the rule carries a signing secret, sign the delivery so the receiving
+  // endpoint can authenticate it. Stripe-style scheme: the signature covers
+  // `${timestamp}.${body}`, binding the timestamp into the MAC so a captured
+  // delivery can't be replayed under a forged time. The receiver recomputes
+  // HMAC-SHA256(secret, `${X-LoopGain-Timestamp}.${rawBody}`), compares in
+  // constant time, and rejects timestamps outside its tolerance window.
+  if (rule.action_secret) {
+    const timestamp = String(firedAt);
+    const signature = await hmacSha256Hex(rule.action_secret, `${timestamp}.${body}`);
+    headers["X-LoopGain-Timestamp"] = timestamp;
+    headers["X-LoopGain-Signature"] = `sha256=${signature}`;
+  }
   try {
     const resp = await fetch(rule.action_url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "loopgain-alerts/1.0",
-      },
-      body: JSON.stringify(payload),
+      headers,
+      body,
       signal: AbortSignal.timeout(5000),
     });
     if (resp.status >= 200 && resp.status < 300) {

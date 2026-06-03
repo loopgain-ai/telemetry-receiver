@@ -26,6 +26,31 @@ All authenticated routes expect `Authorization: Bearer <token>`. Tokens are mapp
 
 A `scheduled` cron handler runs every minute and evaluates each enabled alert rule against the recent `loop_events` window, recording fires to `alert_deliveries`.
 
+### Webhook signature verification
+
+If an alert rule has an `action_secret` set, every webhook delivery is signed so your endpoint can verify it genuinely came from the receiver (and reject forgeries from anyone who learns the URL). Two headers are sent:
+
+- `X-LoopGain-Timestamp` — the fire time, unix seconds.
+- `X-LoopGain-Signature` — `sha256=<hex>`, where `<hex>` is `HMAC-SHA256(action_secret, "{timestamp}.{raw_request_body}")`.
+
+To verify: recompute the HMAC over `` `${X-LoopGain-Timestamp}.${rawBody}` `` using your shared secret, compare against the header value in **constant time**, and reject deliveries whose timestamp is outside your tolerance window (e.g. ±5 min) to defeat replay. Example (Node):
+
+```js
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+function verify(rawBody, headers, secret, toleranceSec = 300) {
+  const ts = headers["x-loopgain-timestamp"];
+  const got = headers["x-loopgain-signature"];
+  if (!ts || !got) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > toleranceSec) return false;
+  const want = "sha256=" + createHmac("sha256", secret).update(`${ts}.${rawBody}`).digest("hex");
+  const a = Buffer.from(got), b = Buffer.from(want);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+```
+
+Rules without an `action_secret` are delivered unsigned. The secret is write-only — it is never returned by the read endpoints.
+
 ---
 
 ## Architecture
