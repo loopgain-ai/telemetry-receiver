@@ -698,8 +698,7 @@ function classificationFilters(url: URL): { sql: string; binds: string[] } {
 // reduce payload) or up to MAX_ROW_LIMIT. Previously the limits were
 // hard-coded (500 on /v1/events, 1000 on /v1/profiles) which silently
 // truncated the dashboard's view of any tenant with more activity than
-// that — recency-biased and invisible to the UI. See Issue 1 in
-// RECEIVER_ACCURACY_FIXES_KICKOFF.md.
+// that — recency-biased and invisible to the UI.
 const DEFAULT_ROW_LIMIT = 5000;
 const MAX_ROW_LIMIT = 50000;
 function parseRowLimit(url: URL): number {
@@ -794,8 +793,7 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
     // shouldn't anchor the median. A NULL gain_margin means the metric
     // wasn't computable. The previous COALESCE(profile_max, 0.0) drove
     // ab_median to 0 for any tenant with a meaningful fraction of
-    // TARGET_MET-at-iter-1 runs (see Issue 2 in
-    // RECEIVER_ACCURACY_FIXES_KICKOFF.md). The right framing is
+    // TARGET_MET-at-iter-1 runs. The right framing is
     // "median Aβ across runs that had measurable Aβ".
     const r = await env.DB.prepare(
       `WITH ordered AS (
