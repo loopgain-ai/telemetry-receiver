@@ -470,6 +470,61 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
   return json({ status: "ok" }, 202);
 }
 
+// ── Tenant self-reset ─────────────────────────────────────────────────
+//
+// POST /v1/aggregate/reset  {"confirm":"reset"}
+//
+// Deletes every loop_events row for the *calling* tenant and nothing else.
+// Self-scoped by construction: the customer_id comes from the bearer token,
+// and the DELETE is keyed on exactly that id — a tenant can only ever wipe
+// its own data, never another's. The explicit {"confirm":"reset"} body is a
+// guard against an accidental fire.
+//
+// The reason this exists: ingestion is append-only (loop_events has an
+// autoincrement PK and no upsert key), so re-publishing a corrected dataset
+// would otherwise double-count. The bench back-fill (upload_to_dashboard.py
+// --reset) calls this first so a re-upload is a clean replace, not an append.
+// Server-to-server only, same as /v1/aggregate.
+async function handleAggregateReset(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") {
+    return json({ error: "method_not_allowed" }, 405);
+  }
+  if (request.headers.get("Origin")) {
+    return json({ error: "browser_requests_not_allowed" }, 403);
+  }
+
+  const customerId = await authenticate(request, env);
+  if (!customerId) return json({ error: "unauthorized" }, 401);
+
+  let parsed: unknown;
+  try {
+    parsed = await request.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    (parsed as { confirm?: unknown }).confirm !== "reset"
+  ) {
+    return json(
+      {
+        error: "confirm_required",
+        detail: 'POST {"confirm":"reset"} to delete this tenant\'s loop_events',
+      },
+      400,
+    );
+  }
+
+  const result = await env.DB.prepare(
+    `DELETE FROM loop_events WHERE customer_id = ?`,
+  )
+    .bind(customerId)
+    .run();
+
+  return json({ reset: true, customer_id: customerId, deleted: result.meta.changes ?? 0 });
+}
+
 // ── Funnel telemetry (anonymous, unauthenticated) ─────────────────────
 //
 // Completely separate ingest path from /v1/aggregate above. The product
@@ -1142,6 +1197,10 @@ export default {
     }
 
     let resp: Response;
+    if (url.pathname === "/v1/aggregate/reset") {
+      // Server-to-server tenant self-reset; no CORS, same as ingest.
+      return handleAggregateReset(request, env);
+    }
     if (url.pathname === "/v1/aggregate") {
       // Server-to-server; no CORS headers attached (the library doesn't
       // need them, and refusing them keeps the route invisible to browsers).
