@@ -813,7 +813,12 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
             SUM(actual_dollars_saved) AS total_actual_dollars_saved,
             SUM(CASE WHEN actual_dollars_saved IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_savings,
             SUM(actual_dollars_spent) AS total_actual_dollars_spent,
-            SUM(CASE WHEN actual_dollars_spent IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_spend
+            SUM(CASE WHEN actual_dollars_spent IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_spend,
+            -- Count of loops with a measurable gain margin (ran >= 2 iterations,
+            -- so Abeta was observed). The complement (event_count minus this) is
+            -- loops that converged on the first attempt and never approached the
+            -- instability boundary -- the "stable majority" the GM panel headlines.
+            SUM(CASE WHEN gain_margin IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_gain_margin
        FROM loop_events
        WHERE customer_id = ? AND timestamp_hour >= ?`,
   )
