@@ -91,6 +91,10 @@ CREATE TABLE IF NOT EXISTS loop_events (
     -- Waste panel show measured spend alongside measured savings instead
     -- of falling back to iter × $/iter extrapolation.
     actual_dollars_spent REAL,
+    -- v3.4: 0-based index of the lowest-error iteration. Drives the Iteration
+    -- Waste view: iterations-to-best = best_index+1, iterations-past-best =
+    -- iterations_used-1-best_index. NULL on pre-v3.4 payloads.
+    best_index INTEGER,
     received_at INTEGER NOT NULL DEFAULT (unixepoch()),
     FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
 );

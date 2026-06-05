@@ -136,6 +136,10 @@ interface TelemetryPayload {
     savings_vs_fixed_cap: number | null;
     convergence_profile_summary: ProfileSummary;
     rollback_triggered: boolean;
+    // v3.4 — optional. 0-based index of the lowest-error iteration. Drives the
+    // Iteration Waste view: iterations-to-best = best_index+1, iterations-past-
+    // best = iterations_used-1-best_index.
+    best_index?: number | null;
     // v2 — optional. Present iff schema_version >= 2 and the library
     // captured a prediction during the loop.
     first_eta_prediction?: number | null;
@@ -412,6 +416,12 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
   // never captured a prediction (target_error=0, non-converging trace).
   const firstEta = payload.loop.first_eta_prediction ?? null;
   const firstEtaAt = payload.loop.first_eta_at_iteration ?? null;
+  // v3.4 — 0-based index of the best (lowest-error) iteration. NULL for older
+  // payloads or anything non-finite. Powers the Iteration Waste aggregates.
+  const bestIndex =
+    typeof payload.loop.best_index === "number" && Number.isFinite(payload.loop.best_index)
+      ? payload.loop.best_index
+      : null;
   // v3 fields default to NULL for v1/v2 payloads. per_iteration_data is
   // stored as a JSON string so the dashboard can fetch and parse it.
   const perIterationJson = payload.per_iteration
@@ -434,8 +444,8 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       threshold_stalling, threshold_oscillating_upper,
       smoothing_window, first_eta_prediction, first_eta_at_iteration,
       per_iteration_data, framework, loop_type, team,
-      actual_dollars_saved, actual_dollars_spent
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      actual_dollars_saved, actual_dollars_spent, best_index
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       customerId,
@@ -464,6 +474,7 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       team,
       actualDollarsSaved,
       actualDollarsSpent,
+      bestIndex,
     )
     .run();
 
@@ -818,7 +829,13 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
             -- so Abeta was observed). The complement (event_count minus this) is
             -- loops that converged on the first attempt and never approached the
             -- instability boundary -- the "stable majority" the GM panel headlines.
-            SUM(CASE WHEN gain_margin IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_gain_margin
+            SUM(CASE WHEN gain_margin IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_gain_margin,
+            -- Iteration Waste aggregates (best_index = 0-based lowest-error iter).
+            -- iterations-past-best = iterations_used-1-best_index is the grind a
+            -- naive cap runs after the best output; LoopGain stops near best.
+            SUM(CASE WHEN best_index IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_best_index,
+            COALESCE(SUM(CASE WHEN best_index IS NOT NULL THEN iterations_used - 1 - best_index ELSE 0 END), 0) AS total_iterations_past_best,
+            SUM(CASE WHEN best_index = 0 THEN 1 ELSE 0 END) AS event_count_best_at_iter1
        FROM loop_events
        WHERE customer_id = ? AND timestamp_hour >= ?`,
   )
@@ -1009,7 +1026,7 @@ async function eventsCore(
     .prepare(
       `SELECT id, timestamp_hour, workload_id, framework, loop_type, team,
               outcome, iterations_used, gain_margin, profile_max,
-              savings_vs_fixed_cap, library_version,
+              savings_vs_fixed_cap, library_version, best_index,
               first_eta_prediction, first_eta_at_iteration
          FROM loop_events
          WHERE customer_id = ? AND timestamp_hour >= ?
