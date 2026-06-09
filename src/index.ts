@@ -161,8 +161,8 @@ interface TelemetryPayload {
   actual_dollars_spent?: number | null;
 }
 
-const SUPPORTED_SCHEMA_VERSIONS = [1, 2, 3] as const;
-const CURRENT_SCHEMA_VERSION = 3;
+const SUPPORTED_SCHEMA_VERSIONS = [1, 2, 3, 4] as const;
+const CURRENT_SCHEMA_VERSION = 4;
 
 // Defensive cap on per-iteration arrays at the receiver. The library caps at
 // 256 before transmission; mirroring it here protects against malformed or
