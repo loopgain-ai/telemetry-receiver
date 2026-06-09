@@ -2,7 +2,7 @@
 
 Cloudflare Worker that ingests anonymized telemetry from the [loopgain](https://github.com/loopgain-ai/loopgain) Python library and serves aggregated reads to the [LoopGain dashboard](https://github.com/loopgain-ai/dashboard).
 
-**Privacy contract** (enforced by the library at the source): only structural statistics are sent and stored — state transitions, Aβ summaries (min/max/median), gain margin, rollback flag, library version, optional opaque `workload_id`, threshold config. Never prompts, completions, error contents, output buffers, or any per-iteration Aβ.
+**Privacy contract** (enforced by the library at the source): only structural statistics are sent and stored — state transitions, Aβ summaries (min/max/median), rollback flag, library version, optional opaque `workload_id`, threshold config. Never prompts, completions, error contents, output buffers, or any per-iteration Aβ.
 
 ---
 

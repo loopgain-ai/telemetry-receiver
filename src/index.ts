@@ -25,9 +25,6 @@
  *                                Accepts framework/loop_type/team filter params.
  *   GET  /v1/events              Recent loop events for the rollback log.
  *                                Accepts framework/loop_type/team filter params.
- *   GET  /v1/calibration         Converged loops with eta-prediction snapshots
- *                                (drives the ETA Accuracy dashboard panel).
- *                                Accepts framework/loop_type/team filter params.
  *   GET  /v1/event/:id           Full detail for one event including per-iteration
  *                                trajectory data (drives the Loop Detail scrubber).
  *   GET  /v1/alerts/rules        List the customer's alert rules.
@@ -58,12 +55,13 @@
  *
  * Schema versions:
  *   v1 — initial release.
- *   v2 — adds first_eta_prediction + first_eta_at_iteration on loop_events.
- *        Receiver accepts both v1 and v2 payloads; v1 stores NULL for the
- *        new fields, v2 stores the snapshot when the library captured one.
+ *   v2 — added an ETA-calibration snapshot on loop_events (discontinued).
  *   v3 — adds per_iteration_data (JSON, capped at 256 entries) and three
- *        classification columns: framework, loop_type, team. Receiver
- *        accepts v1/v2/v3; older payloads store NULL for the new fields.
+ *        classification columns: framework, loop_type, team.
+ *   v4 — library stops sending `gain_margin` and the ETA snapshot (both
+ *        features were discontinued). The receiver accepts every prior
+ *        schema; the dropped fields are simply ignored on ingest and the
+ *        legacy D1 columns are left in place (NULL going forward).
  */
 
 interface RateLimit {
@@ -132,7 +130,6 @@ interface TelemetryPayload {
   loop: {
     outcome: string;
     iterations_used: number;
-    gain_margin: number | null;
     savings_vs_fixed_cap: number | null;
     convergence_profile_summary: ProfileSummary;
     rollback_triggered: boolean;
@@ -140,10 +137,8 @@ interface TelemetryPayload {
     // Iteration Waste view: iterations-to-best = best_index+1, iterations-past-
     // best = iterations_used-1-best_index.
     best_index?: number | null;
-    // v2 — optional. Present iff schema_version >= 2 and the library
-    // captured a prediction during the loop.
-    first_eta_prediction?: number | null;
-    first_eta_at_iteration?: number | null;
+    // NB: pre-v4 payloads may also carry gain_margin / first_eta_* keys. They
+    // are accepted but ignored — both features were discontinued in v4.
   };
   thresholds: {
     fast_converge: number;
@@ -316,16 +311,6 @@ function validatePayload(payload: unknown): payload is TelemetryPayload {
   if (!p.thresholds) return false;
   if (typeof p.smoothing_window !== "number") return false;
 
-  // v2 fields (if provided) must be either null or a non-negative integer.
-  if (p.schema_version >= 2) {
-    const { first_eta_prediction: eta, first_eta_at_iteration: at } = p.loop;
-    if (eta !== undefined && eta !== null && (typeof eta !== "number" || eta < 0)) {
-      return false;
-    }
-    if (at !== undefined && at !== null && (typeof at !== "number" || at < 0)) {
-      return false;
-    }
-  }
   // v3 fields (if provided) must match the expected shape.
   if (p.schema_version >= 3) {
     for (const k of ["framework", "loop_type", "team"] as const) {
@@ -412,10 +397,6 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
   if (ts === null) return json({ error: "invalid_timestamp_hour" }, 400);
 
   const summary = payload.loop.convergence_profile_summary;
-  // v2 fields default to NULL for v1 payloads or when the library
-  // never captured a prediction (target_error=0, non-converging trace).
-  const firstEta = payload.loop.first_eta_prediction ?? null;
-  const firstEtaAt = payload.loop.first_eta_at_iteration ?? null;
   // v3.4 — 0-based index of the best (lowest-error) iteration. NULL for older
   // payloads or anything non-finite. Powers the Iteration Waste aggregates.
   const bestIndex =
@@ -435,6 +416,8 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
 
   // received_at is omitted from the column list; the schema's
   // `DEFAULT (unixepoch())` fills it. 26 columns, 26 bound values.
+  // The legacy gain_margin / first_eta_* columns are retained in the schema
+  // but always written NULL — both features were discontinued in v4.
   await env.DB.prepare(
     `INSERT INTO loop_events (
       customer_id, workload_id, timestamp_hour, library_version,
@@ -454,7 +437,7 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       payload.library_version,
       payload.loop.outcome,
       payload.loop.iterations_used,
-      payload.loop.gain_margin,
+      null, // gain_margin (discontinued v4)
       payload.loop.savings_vs_fixed_cap,
       payload.loop.rollback_triggered ? 1 : 0,
       summary.min,
@@ -466,8 +449,8 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
       payload.thresholds.stalling,
       payload.thresholds.oscillating_upper,
       payload.smoothing_window,
-      firstEta,
-      firstEtaAt,
+      null, // first_eta_prediction (discontinued v4)
+      null, // first_eta_at_iteration (discontinued v4)
       perIterationJson,
       framework,
       loopType,
@@ -761,7 +744,7 @@ async function handleFunnel(request: Request, env: Env): Promise<Response> {
 
 // ── Helper: build a classification-filter clause + bind values ────────
 //
-// Used by /v1/profiles, /v1/events, /v1/calibration. Returns a SQL
+// Used by /v1/profiles and /v1/events. Returns a SQL
 // fragment that goes after WHERE customer_id = ? AND timestamp_hour >= ?
 // and the additional bind values to append in order.
 function classificationFilters(url: URL): { sql: string; binds: string[] } {
@@ -825,11 +808,6 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
             SUM(CASE WHEN actual_dollars_saved IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_savings,
             SUM(actual_dollars_spent) AS total_actual_dollars_spent,
             SUM(CASE WHEN actual_dollars_spent IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_spend,
-            -- Count of loops with a measurable gain margin (ran >= 2 iterations,
-            -- so Abeta was observed). The complement (event_count minus this) is
-            -- loops that converged on the first attempt and never approached the
-            -- instability boundary -- the "stable majority" the GM panel headlines.
-            SUM(CASE WHEN gain_margin IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_gain_margin,
             -- Iteration Waste aggregates (best_index = 0-based lowest-error iter).
             -- iterations-past-best = iterations_used-1-best_index is the grind a
             -- naive cap runs after the best output; LoopGain stops near best.
@@ -874,7 +852,7 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
     distinctValues("team"),
   ]);
 
-  // Tenant-wide aggregates of profile_max (Aβ proxy) and gain_margin.
+  // Tenant-wide aggregates of profile_max (Aβ proxy).
   // Dashboards previously computed these client-side from /v1/events, but
   // that endpoint caps at LIMIT 500 ordered by timestamp DESC — a recency-
   // biased sample. Surfacing them here means a tenant with thousands of
@@ -882,14 +860,11 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
   // PERCENTILE_CONT, so each percentile is a small CTE: median uses the
   // standard "AVG of the two middle rows" trick (works for even+odd N);
   // p99 / p10 use "smallest row past the cutoff fraction".
-  async function percentileAgg(column: "profile_max" | "gain_margin") {
-    // Both columns exclude NULL rows: a NULL profile_max means the loop
-    // converged at iter 1 (TARGET_MET) and never had Aβ measured, so it
-    // shouldn't anchor the median. A NULL gain_margin means the metric
-    // wasn't computable. The previous COALESCE(profile_max, 0.0) drove
-    // ab_median to 0 for any tenant with a meaningful fraction of
-    // TARGET_MET-at-iter-1 runs. The right framing is
-    // "median Aβ across runs that had measurable Aβ".
+  async function percentileAgg(column: "profile_max") {
+    // NULL rows are excluded: a NULL profile_max means the loop converged at
+    // iter 1 (TARGET_MET) and never had Aβ measured, so it shouldn't anchor
+    // the median. The right framing is "median Aβ across runs that had
+    // measurable Aβ".
     const r = await env.DB.prepare(
       `WITH ordered AS (
          SELECT ${column} AS v,
@@ -908,10 +883,7 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
       .first<{ median: number | null; p99: number | null; p10: number | null }>();
     return r;
   }
-  const [abAgg, gmAgg] = await Promise.all([
-    percentileAgg("profile_max"),
-    percentileAgg("gain_margin"),
-  ]);
+  const abAgg = await percentileAgg("profile_max");
 
   // Per-outcome aggregates over the full window. The dashboard's Waste
   // "By outcome" breakdown previously extrapolated from the 500-row
@@ -948,8 +920,6 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
     aggregates: {
       ab_median: abAgg?.median ?? null,
       ab_p99: abAgg?.p99 ?? null,
-      gm_median: gmAgg?.median ?? null,
-      gm_p10: gmAgg?.p10 ?? null,
       by_outcome: byOutcome.results,
     },
   });
@@ -984,7 +954,7 @@ async function profilesCore(
   const result = await env.DB.prepare(
     `SELECT id, timestamp_hour, workload_id, framework, loop_type, team,
             profile_min, profile_max, profile_median, profile_samples,
-            outcome, iterations_used, gain_margin
+            outcome, iterations_used
        FROM loop_events
        WHERE customer_id = ? AND timestamp_hour >= ? ${filters.sql}
        ORDER BY timestamp_hour DESC
@@ -1025,9 +995,8 @@ async function eventsCore(
   const result = await env.DB
     .prepare(
       `SELECT id, timestamp_hour, workload_id, framework, loop_type, team,
-              outcome, iterations_used, gain_margin, profile_max,
-              savings_vs_fixed_cap, library_version, best_index,
-              first_eta_prediction, first_eta_at_iteration
+              outcome, iterations_used, profile_max,
+              savings_vs_fixed_cap, library_version, best_index
          FROM loop_events
          WHERE customer_id = ? AND timestamp_hour >= ?
            ${rollbackClause} ${filters.sql}
@@ -1037,54 +1006,6 @@ async function eventsCore(
     .bind(customerId, since, ...filters.binds, limit)
     .all();
   return json({ customer_id: customerId, events: result.results });
-}
-
-async function handleCalibration(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "GET") {
-    return json({ error: "method_not_allowed" }, 405);
-  }
-  const customerId = await authenticate(request, env);
-  if (!customerId) return json({ error: "unauthorized" }, 401);
-  const rl = await env.READ_RL.limit({ key: customerId });
-  if (!rl.success) return json({ error: "rate_limited" }, 429);
-  return calibrationCore(new URL(request.url), env, customerId);
-}
-
-async function calibrationCore(
-  url: URL,
-  env: Env,
-  customerId: string,
-): Promise<Response> {
-  const sinceParam = url.searchParams.get("since_hours");
-  const since =
-    Math.floor(Date.now() / 1000) -
-    (sinceParam ? parseInt(sinceParam, 10) * 3600 : 30 * 24 * 3600);
-
-  // Only converged loops with a captured eta prediction. Comparing
-  // predicted-vs-actual for diverged/oscillating loops doesn't make sense
-  // because they terminated before reaching target.
-  const filters = classificationFilters(url);
-  const result = await env.DB
-    .prepare(
-      `SELECT id, timestamp_hour, workload_id, framework, loop_type, team,
-              iterations_used, first_eta_prediction, first_eta_at_iteration,
-              gain_margin, library_version
-         FROM loop_events
-         WHERE customer_id = ?
-           AND outcome = 'converged'
-           AND first_eta_prediction IS NOT NULL
-           AND first_eta_at_iteration IS NOT NULL
-           AND timestamp_hour >= ? ${filters.sql}
-         ORDER BY timestamp_hour DESC
-         LIMIT 1000`,
-    )
-    .bind(customerId, since, ...filters.binds)
-    .all();
-  return json({
-    customer_id: customerId,
-    workload_id: url.searchParams.get("workload_id"),
-    events: result.results,
-  });
 }
 
 async function handleEventDetail(
@@ -1115,12 +1036,12 @@ async function eventDetailCore(
   const row = await env.DB
     .prepare(
       `SELECT id, timestamp_hour, workload_id, framework, loop_type, team,
-              library_version, outcome, iterations_used, gain_margin,
+              library_version, outcome, iterations_used,
               savings_vs_fixed_cap, rollback_triggered, profile_min,
               profile_max, profile_median, profile_samples,
               threshold_fast_converge, threshold_converging,
               threshold_stalling, threshold_oscillating_upper,
-              smoothing_window, first_eta_prediction, first_eta_at_iteration,
+              smoothing_window,
               per_iteration_data, received_at
          FROM loop_events
          WHERE id = ? AND customer_id = ?`,
@@ -1258,9 +1179,6 @@ export default {
       case "/v1/events":
         resp = await handleEvents(request, env);
         break;
-      case "/v1/calibration":
-        resp = await handleCalibration(request, env);
-        break;
       default:
         resp = json({ error: "not_found" }, 404);
     }
@@ -1294,11 +1212,6 @@ type AlertPredicate =
       metric: "rollback_rate";
       operator: ">" | ">=" | "<" | "<=" | "=";
       threshold: number; // 0..1
-    }
-  | {
-      metric: "gain_margin_min";
-      operator: "<" | "<=";
-      threshold: number;
     };
 
 interface AlertFilter {
@@ -1337,7 +1250,6 @@ function validatePredicate(p: unknown): p is AlertPredicate {
     case "outcome_count":
       return typeof x.outcome === "string" && x.outcome.length > 0;
     case "rollback_count":
-    case "gain_margin_min":
       return true;
     case "rollback_rate":
       return x.threshold >= 0 && x.threshold <= 1;
@@ -1673,7 +1585,6 @@ async function handlePublicBenchmark(
   if (tail === "stats") inner = await statsCore(env, BENCH_CUSTOMER_ID);
   else if (tail === "profiles") inner = await profilesCore(url, env, BENCH_CUSTOMER_ID);
   else if (tail === "events") inner = await eventsCore(url, env, BENCH_CUSTOMER_ID);
-  else if (tail === "calibration") inner = await calibrationCore(url, env, BENCH_CUSTOMER_ID);
   else if (tail === "alerts/rules") inner = await alertRulesListCore(env, BENCH_CUSTOMER_ID);
   else if (tail === "alerts/deliveries") inner = await alertDeliveriesCore(env, BENCH_CUSTOMER_ID);
   else if (tail.startsWith("event/")) {
@@ -1707,7 +1618,7 @@ async function markIfEmpty(resp: Response, tail: string): Promise<Response> {
     if (tail === "stats") {
       const totals = b.totals as { event_count?: number } | null;
       isEmpty = !totals || (totals.event_count ?? 0) === 0;
-    } else if (tail === "profiles" || tail === "events" || tail === "calibration") {
+    } else if (tail === "profiles" || tail === "events") {
       isEmpty = !Array.isArray(b.events) || (b.events as unknown[]).length === 0;
     } else if (tail === "alerts/rules") {
       isEmpty = !Array.isArray(b.rules) || (b.rules as unknown[]).length === 0;
@@ -1821,24 +1732,6 @@ async function evaluateRule(
         match: total > 0 && compareOp(predicate.operator, rate, predicate.threshold),
         matchValue: rate,
         matchCount: rb,
-      };
-    }
-    case "gain_margin_min": {
-      const r = await env.DB
-        .prepare(
-          `SELECT COUNT(*) AS n, MIN(gain_margin) AS gm FROM loop_events
-            WHERE customer_id = ? AND timestamp_hour >= ?
-              AND gain_margin IS NOT NULL
-              AND ${predicate.operator === "<" ? "gain_margin <" : "gain_margin <="} ?
-              ${f.sql}`,
-        )
-        .bind(rule.customer_id, since, predicate.threshold, ...f.binds)
-        .first<{ n: number; gm: number | null }>();
-      const n = r?.n ?? 0;
-      return {
-        match: n > 0,
-        matchValue: r?.gm ?? predicate.threshold,
-        matchCount: n,
       };
     }
   }
