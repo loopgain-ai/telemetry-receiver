@@ -19,6 +19,14 @@ zone_name = "loopgain.ai"
 [observability]
 enabled = true
 
+# Alert email delivery (action_type "email"). ALERT_FROM is the Resend
+# sender; alerts@loopgain.ai is verified on the apex. The companion
+# RESEND_API_KEY is a wrangler secret (`wrangler secret put RESEND_API_KEY`).
+# When the secret is unset, email deliveries record `email_not_configured`
+# in the audit trail; webhook/slack channels are unaffected.
+[vars]
+ALERT_FROM = "LoopGain Alerts <alerts@loopgain.ai>"
+
 # Scheduled trigger for the alert evaluator. Runs once per minute and
 # evaluates every enabled alert_rule against the last `window_seconds` of
 # loop_events. See `scheduled` export in src/index.ts.

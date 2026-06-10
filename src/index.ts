@@ -31,6 +31,10 @@
  *   POST /v1/alerts/rules        Create a new alert rule.
  *   PUT  /v1/alerts/rules/:id    Update an existing alert rule.
  *   DELETE /v1/alerts/rules/:id  Delete an alert rule.
+ *   POST /v1/alerts/rules/:id/test  Fire the rule's delivery channel once with
+ *                                a marked test payload. Does not consume the
+ *                                rule's cooldown; email test fires count toward
+ *                                the per-customer email daily cap.
  *   GET  /v1/alerts/deliveries   Audit log of alert deliveries (recent first).
  *   GET  /health                 Liveness probe (public, no auth).
  *
@@ -76,6 +80,12 @@ export interface Env {
   READ_RL: RateLimit;       // Per-customer on GET /v1/* read routes.
   PUBLIC_RL: RateLimit;     // Per-IP on /v1/public/benchmark/* (unauth bench view).
   FUNNEL_RL: RateLimit;     // Per-IP on POST /v1/funnel (unauth anonymous funnel).
+  // Alert email delivery (action_type "email"). RESEND_API_KEY is a wrangler
+  // secret; ALERT_FROM is a plain var (e.g. "LoopGain Alerts <alerts@loopgain.ai>").
+  // Both optional: when unset, email deliveries record `email_not_configured`
+  // in the audit trail and are skipped; webhook/slack channels are unaffected.
+  RESEND_API_KEY?: string;
+  ALERT_FROM?: string;
 }
 
 // Hardcoded customer_id for the public benchmark view served at
@@ -1160,6 +1170,11 @@ export default {
       resp = await handleAlertRulesCollection(request, env);
       return withHeaders(resp, corsHeaders(request));
     }
+    if (url.pathname.startsWith("/v1/alerts/rules/") && url.pathname.endsWith("/test")) {
+      const idStr = url.pathname.slice("/v1/alerts/rules/".length, -"/test".length);
+      resp = await handleAlertRuleTest(request, env, idStr);
+      return withHeaders(resp, corsHeaders(request));
+    }
     if (url.pathname.startsWith("/v1/alerts/rules/")) {
       const idStr = url.pathname.slice("/v1/alerts/rules/".length);
       resp = await handleAlertRuleItem(request, env, idStr);
@@ -1186,7 +1201,8 @@ export default {
   },
 
   // Scheduled cron handler — evaluates every enabled alert_rule and fires
-  // webhook deliveries that match. Runs every minute (see wrangler.toml).
+  // the rule's delivery channel (webhook / slack / email) on match. Runs
+  // every minute (see wrangler.toml).
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(evaluateAlertRules(env));
   },
@@ -1320,6 +1336,19 @@ function validateActionUrl(raw: string): string | null {
   return null;
 }
 
+// Delivery channels. `action_url` is the channel target: a webhook URL, a
+// Slack incoming-webhook URL, or (for "email") a bare email address — the
+// column name predates multi-channel support and is kept to avoid a
+// pointless migration.
+type AlertActionType = "webhook" | "slack" | "email";
+const VALID_ACTION_TYPES = new Set<string>(["webhook", "slack", "email"]);
+
+// Email-channel abuse guards. The cron runs every minute, so a cooldown
+// floor is what makes an inbox un-floodable; the daily cap bounds total
+// Resend volume per customer (counts sent + test_sent over 24h).
+const EMAIL_COOLDOWN_FLOOR_SECONDS = 300;
+const EMAIL_DAILY_CAP = 50;
+
 interface AlertRulePayload {
   name: string;
   enabled?: boolean;
@@ -1327,9 +1356,32 @@ interface AlertRulePayload {
   filter?: AlertFilter | null;
   window_seconds: number;
   cooldown_seconds?: number;
-  action_type: "webhook";
+  action_type: AlertActionType;
   action_url: string;
   action_secret?: string | null;
+}
+
+// Syntactic check only — one @, non-empty local part, dotted domain, no
+// whitespace. Deliverability is Resend's problem; this just keeps junk and
+// header-injection shapes out of the column.
+function validateEmailAddress(raw: string): boolean {
+  if (raw.length === 0 || raw.length > 254) return false;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(raw);
+}
+
+// Slack incoming webhooks live exclusively on hooks.slack.com; pinning the
+// host is stricter than the general SSRF guard and prevents the slack
+// channel from being used as an arbitrary-URL POST primitive.
+function validateSlackHookUrl(raw: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return "invalid_url";
+  }
+  if (u.protocol !== "https:") return "https_required";
+  if (u.hostname.toLowerCase() !== "hooks.slack.com") return "slack_host_required";
+  return null;
 }
 
 function validateRulePayload(body: unknown): { ok: true; value: AlertRulePayload } | { ok: false; error: string } {
@@ -1361,10 +1413,35 @@ function validateRulePayload(body: unknown): { ok: true; value: AlertRulePayload
       return { ok: false, error: "invalid_cooldown_seconds" };
     }
   }
-  if (b.action_type !== "webhook") return { ok: false, error: "invalid_action_type" };
-  if (typeof b.action_url !== "string") return { ok: false, error: "invalid_action_url" };
-  const urlErr = validateActionUrl(b.action_url);
-  if (urlErr) return { ok: false, error: urlErr };
+  if (typeof b.action_type !== "string" || !VALID_ACTION_TYPES.has(b.action_type)) {
+    return { ok: false, error: "invalid_action_type" };
+  }
+  if (typeof b.action_url !== "string" || b.action_url.length > 2048) {
+    return { ok: false, error: "invalid_action_url" };
+  }
+  if (b.action_type === "email") {
+    if (!validateEmailAddress(b.action_url)) return { ok: false, error: "invalid_email_address" };
+    // Email can't verify a signature, so a secret on an email rule is a
+    // configuration mistake — reject rather than silently ignore.
+    if (b.action_secret !== undefined && b.action_secret !== null) {
+      return { ok: false, error: "secret_not_supported_for_email" };
+    }
+    const cooldown = (b.cooldown_seconds as number | undefined) ?? 600;
+    if (cooldown < EMAIL_COOLDOWN_FLOOR_SECONDS) {
+      return { ok: false, error: "email_cooldown_too_short" };
+    }
+  } else if (b.action_type === "slack") {
+    const slackErr = validateSlackHookUrl(b.action_url);
+    if (slackErr) return { ok: false, error: slackErr };
+    // Slack incoming webhooks authenticate via the URL itself; custom
+    // signature headers aren't verifiable on Slack's side.
+    if (b.action_secret !== undefined && b.action_secret !== null) {
+      return { ok: false, error: "secret_not_supported_for_slack" };
+    }
+  } else {
+    const urlErr = validateActionUrl(b.action_url);
+    if (urlErr) return { ok: false, error: urlErr };
+  }
   if (
     b.action_secret !== undefined &&
     b.action_secret !== null &&
@@ -1503,14 +1580,85 @@ async function handleAlertRuleItem(
     return json({ rule: ruleRowToWire(updated) });
   }
   if (request.method === "DELETE") {
-    const result = await env.DB
-      .prepare(`DELETE FROM alert_rules WHERE id = ? AND customer_id = ?`)
-      .bind(id, customerId)
-      .run();
-    if ((result.meta.changes ?? 0) === 0) return json({ error: "not_found" }, 404);
+    // The rule's delivery rows must go in the same batch: alert_deliveries
+    // carries an FK to alert_rules, so deleting a rule that ever fired (or
+    // was test-fired) would otherwise 500 on the constraint. The deliveries
+    // API JOINs on alert_rules, so orphaned rows would be invisible anyway —
+    // removing them with the rule is the behavior the UI already implies.
+    const [, ruleResult] = await env.DB.batch([
+      env.DB
+        .prepare(`DELETE FROM alert_deliveries WHERE rule_id = ? AND customer_id = ?`)
+        .bind(id, customerId),
+      env.DB
+        .prepare(`DELETE FROM alert_rules WHERE id = ? AND customer_id = ?`)
+        .bind(id, customerId),
+    ]);
+    if ((ruleResult?.meta.changes ?? 0) === 0) return json({ error: "not_found" }, 404);
     return json({ deleted: id });
   }
   return json({ error: "method_not_allowed" }, 405);
+}
+
+// POST /v1/alerts/rules/:id/test — fire the rule's real delivery path once
+// with a marked test payload, so a customer can verify the channel works the
+// moment they configure it (no waiting for a real band transition). Does NOT
+// touch last_fired_at (a test must not eat the rule's cooldown), but the
+// delivery is recorded in the audit trail as test_sent/test_failed, and email
+// test fires count toward the per-customer daily cap (see deliverEmail).
+async function handleAlertRuleTest(
+  request: Request,
+  env: Env,
+  idStr: string,
+): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+  const customerId = await authenticate(request, env);
+  if (!customerId) return json({ error: "unauthorized" }, 401);
+  const rl = await env.READ_RL.limit({ key: customerId });
+  if (!rl.success) return json({ error: "rate_limited" }, 429);
+
+  const id = Number(idStr);
+  if (!Number.isInteger(id) || id <= 0) return json({ error: "invalid_rule_id" }, 400);
+
+  const rule = await env.DB
+    .prepare(
+      `SELECT id, customer_id, name, enabled, predicate, filter,
+              window_seconds, cooldown_seconds, action_type, action_url,
+              action_secret, created_at, updated_at, last_fired_at
+         FROM alert_rules
+         WHERE id = ? AND customer_id = ?`,
+    )
+    .bind(id, customerId)
+    .first<AlertRuleRow>();
+  if (!rule) return json({ error: "not_found" }, 404);
+
+  const now = Math.floor(Date.now() / 1000);
+  // matchValue -1 marks the row as synthetic in the audit trail; the test
+  // payload/subject is what tells the receiving end it's a test.
+  const testResult: EvaluationResult = { match: true, matchValue: -1, matchCount: 0 };
+  const delivery = await deliverAlert(env, rule, testResult, now, true);
+  await env.DB
+    .prepare(
+      `INSERT INTO alert_deliveries
+         (rule_id, customer_id, fired_at, match_value, match_count,
+          delivery_status, delivery_status_code, delivery_error)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      rule.id,
+      customerId,
+      now,
+      testResult.matchValue,
+      testResult.matchCount,
+      delivery.status === "sent" ? "test_sent" : "test_failed",
+      delivery.statusCode,
+      delivery.error,
+    )
+    .run();
+  return json({
+    test: delivery.status,
+    status_code: delivery.statusCode,
+    error: delivery.error,
+  });
 }
 
 async function alertRulesListCore(
@@ -1737,11 +1885,58 @@ async function evaluateRule(
   }
 }
 
+interface DeliveryOutcome {
+  status: "sent" | "failed";
+  statusCode: number | null;
+  error: string | null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// POST with bounded retry. Transient failures (network error, 5xx, 429) are
+// retried up to 2 extra attempts with a short backoff — the same policy the
+// library applies to telemetry sends (loopgain v0.4.3). Deterministic 4xx is
+// never retried: the request won't get better by repeating it. Worst case
+// wall-time per delivery: 3 × 5s timeout + 1.5s backoff, bounded well inside
+// the cron's budget.
+async function postWithRetry(
+  url: string,
+  body: string,
+  headers: Record<string, string>,
+): Promise<DeliveryOutcome> {
+  let lastStatus: number | null = null;
+  let lastError: string | null = "unknown_error";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await sleep(attempt === 1 ? 500 : 1000);
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers,
+        body,
+        signal: AbortSignal.timeout(5000),
+      });
+      if (resp.status >= 200 && resp.status < 300) {
+        return { status: "sent", statusCode: resp.status, error: null };
+      }
+      lastStatus = resp.status;
+      lastError = "non_2xx";
+      if (resp.status < 500 && resp.status !== 429) break;
+    } catch (err) {
+      lastStatus = null;
+      lastError = err instanceof Error ? err.message.slice(0, 200) : "unknown_error";
+    }
+  }
+  return { status: "failed", statusCode: lastStatus, error: lastError };
+}
+
 async function deliverWebhook(
   rule: AlertRuleRow,
   result: EvaluationResult,
   firedAt: number,
-): Promise<{ status: "sent" | "failed"; statusCode: number | null; error: string | null }> {
+  test = false,
+): Promise<DeliveryOutcome> {
   // Re-validate at fire time: rules persist, but validateActionUrl can
   // evolve (e.g., a new private range added). A previously-permitted URL
   // that now resolves to "private_url_not_allowed" is short-circuited
@@ -1762,6 +1957,10 @@ async function deliverWebhook(
     window_seconds: rule.window_seconds,
     match_value: result.matchValue,
     match_count: result.matchCount,
+    // Present (true) only on test fires from POST /v1/alerts/rules/:id/test,
+    // so receiving endpoints can distinguish a connectivity test from a real
+    // alert. Absent on real deliveries — existing consumers see no change.
+    ...(test ? { test: true } : {}),
   };
   // Serialize once so the bytes we sign are exactly the bytes we send.
   const body = JSON.stringify(payload);
@@ -1781,27 +1980,145 @@ async function deliverWebhook(
     headers["X-LoopGain-Timestamp"] = timestamp;
     headers["X-LoopGain-Signature"] = `sha256=${signature}`;
   }
-  try {
-    const resp = await fetch(rule.action_url, {
-      method: "POST",
-      headers,
-      body,
-      signal: AbortSignal.timeout(5000),
-    });
-    if (resp.status >= 200 && resp.status < 300) {
-      return { status: "sent", statusCode: resp.status, error: null };
-    }
-    return {
-      status: "failed",
-      statusCode: resp.status,
-      error: `non_2xx`,
-    };
-  } catch (err) {
-    return {
-      status: "failed",
-      statusCode: null,
-      error: err instanceof Error ? err.message.slice(0, 200) : "unknown_error",
-    };
+  return postWithRetry(rule.action_url, body, headers);
+}
+
+// Human-readable one-liner of what fired, shared by the Slack and email
+// formatters. rollback_rate is a 0..1 fraction; render as a percentage.
+function describeFire(rule: AlertRuleRow, result: EvaluationResult): string {
+  const predicate = JSON.parse(rule.predicate) as AlertPredicate;
+  const observed =
+    predicate.metric === "rollback_rate"
+      ? `${(result.matchValue * 100).toFixed(1)}%`
+      : String(result.matchCount);
+  const metricLabel =
+    predicate.metric === "outcome_count"
+      ? `outcome_count(${predicate.outcome})`
+      : predicate.metric;
+  const windowMin = Math.max(1, Math.round(rule.window_seconds / 60));
+  return `${metricLabel} ${predicate.operator} ${predicate.threshold} — observed ${observed} over the last ${windowMin} min`;
+}
+
+async function deliverSlack(
+  rule: AlertRuleRow,
+  result: EvaluationResult,
+  firedAt: number,
+  test = false,
+): Promise<DeliveryOutcome> {
+  const slackErr = validateSlackHookUrl(rule.action_url);
+  if (slackErr) {
+    return { status: "failed", statusCode: null, error: `url_rejected:${slackErr}` };
+  }
+  // Slack incoming webhooks authenticate via the URL itself; deliveries to
+  // Slack are unsigned by design (custom headers aren't verifiable there).
+  const title = test
+    ? `:white_check_mark: LoopGain test alert: *${rule.name}*`
+    : `:rotating_light: LoopGain alert: *${rule.name}*`;
+  const lines = [
+    title,
+    test
+      ? "This is a test fire from the dashboard — the rule's delivery channel works."
+      : describeFire(rule, result),
+    `<https://dashboard.loopgain.ai/|Open dashboard>`,
+  ];
+  const body = JSON.stringify({ text: lines.join("\n") });
+  return postWithRetry(rule.action_url, body, {
+    "Content-Type": "application/json",
+    "User-Agent": "loopgain-alerts/1.0",
+  });
+}
+
+async function deliverEmail(
+  env: Env,
+  rule: AlertRuleRow,
+  result: EvaluationResult,
+  firedAt: number,
+  test = false,
+): Promise<DeliveryOutcome> {
+  if (!env.RESEND_API_KEY || !env.ALERT_FROM) {
+    return { status: "failed", statusCode: null, error: "email_not_configured" };
+  }
+  // Re-validate at fire time, mirroring deliverWebhook.
+  if (!validateEmailAddress(rule.action_url)) {
+    return { status: "failed", statusCode: null, error: "url_rejected:invalid_email_address" };
+  }
+  // Per-customer daily cap across ALL email rules (sent + test_sent). The
+  // cooldown floor bounds per-rule frequency; this bounds the aggregate so
+  // 50 rules can't add up to an unbounded Resend bill or a spam vector.
+  const capRow = await env.DB
+    .prepare(
+      `SELECT COUNT(*) AS n
+         FROM alert_deliveries d
+         JOIN alert_rules r ON r.id = d.rule_id
+        WHERE d.customer_id = ?
+          AND d.fired_at >= ?
+          AND r.action_type = 'email'
+          AND d.delivery_status IN ('sent', 'test_sent')`,
+    )
+    .bind(rule.customer_id, firedAt - 86400)
+    .first<{ n: number }>();
+  if ((capRow?.n ?? 0) >= EMAIL_DAILY_CAP) {
+    return { status: "failed", statusCode: null, error: "email_daily_cap_reached" };
+  }
+  const subject = test
+    ? `[LoopGain] Test alert: ${rule.name}`
+    : `[LoopGain] Alert fired: ${rule.name}`;
+  const bodyLines = test
+    ? [
+        `This is a test fire of your alert rule "${rule.name}" from the LoopGain dashboard.`,
+        ``,
+        `If you're reading this, the email delivery channel works.`,
+      ]
+    : [
+        `Your alert rule "${rule.name}" fired.`,
+        ``,
+        describeFire(rule, result),
+        ``,
+        `Review the loop activity: https://dashboard.loopgain.ai/`,
+      ];
+  bodyLines.push(
+    ``,
+    `--`,
+    `You receive this because this address is the delivery target of an`,
+    `alert rule in your LoopGain workspace. Edit or delete the rule in`,
+    `Settings -> Alert rules to stop these.`,
+  );
+  const body = JSON.stringify({
+    from: env.ALERT_FROM,
+    to: rule.action_url,
+    subject,
+    text: bodyLines.join("\n"),
+  });
+  return postWithRetry("https://api.resend.com/emails", body, {
+    Authorization: `Bearer ${env.RESEND_API_KEY}`,
+    "Content-Type": "application/json",
+    "User-Agent": "loopgain-alerts/1.0",
+  });
+}
+
+// Channel dispatch. Unknown action_type (e.g., a rule created by a newer
+// deploy that was then rolled back) records a failure row and never crashes
+// the evaluator.
+async function deliverAlert(
+  env: Env,
+  rule: AlertRuleRow,
+  result: EvaluationResult,
+  firedAt: number,
+  test = false,
+): Promise<DeliveryOutcome> {
+  switch (rule.action_type) {
+    case "webhook":
+      return deliverWebhook(rule, result, firedAt, test);
+    case "slack":
+      return deliverSlack(rule, result, firedAt, test);
+    case "email":
+      return deliverEmail(env, rule, result, firedAt, test);
+    default:
+      return {
+        status: "failed",
+        statusCode: null,
+        error: `unknown_action_type:${rule.action_type}`,
+      };
   }
 }
 
@@ -1842,7 +2159,7 @@ async function evaluateAlertRules(env: Env): Promise<void> {
         .run();
       continue;
     }
-    const delivery = await deliverWebhook(rule, evalResult, now);
+    const delivery = await deliverAlert(env, rule, evalResult, now);
     await env.DB
       .prepare(
         `INSERT INTO alert_deliveries

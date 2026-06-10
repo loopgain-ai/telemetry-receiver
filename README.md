@@ -18,12 +18,26 @@ Cloudflare Worker that ingests anonymized telemetry from the [loopgain](https://
 | `/v1/event/:id` | GET | Bearer | Full detail for one event including per-iteration trajectories (drives Loop Detail scrubbing). |
 | `/v1/alerts/rules` | GET / POST | Bearer | List or create alert rules. |
 | `/v1/alerts/rules/:id` | PUT / DELETE | Bearer | Update or delete an alert rule. |
+| `/v1/alerts/rules/:id/test` | POST | Bearer | Fire the rule's delivery channel once with a marked test payload (doesn't consume the rule's cooldown). |
 | `/v1/alerts/deliveries` | GET | Bearer | Audit log of alert deliveries (recent first). |
 | `/health` | GET | none | Liveness probe. |
 
 All authenticated routes expect `Authorization: Bearer <token>`. Tokens are mapped to a `customer_id`; only that customer's data is returned.
 
 A `scheduled` cron handler runs every minute and evaluates each enabled alert rule against the recent `loop_events` window, recording fires to `alert_deliveries`.
+
+### Alert delivery channels
+
+Each rule's `action_type` selects how a fire is delivered. Transient failures
+(network, 5xx, 429) are retried up to 2 extra times with a short backoff;
+deterministic 4xx is never retried. Every attempt's outcome lands in the
+`alert_deliveries` audit trail.
+
+| `action_type` | `action_url` is… | Notes |
+|---|---|---|
+| `webhook` | An HTTPS URL | Signed JSON POST when `action_secret` is set (see below). Private/internal destinations are rejected. |
+| `slack` | A Slack incoming-webhook URL | Host-pinned to `hooks.slack.com`. Unsigned — the URL itself is the credential, so `action_secret` is rejected. |
+| `email` | A single email address | Sent via Resend from `ALERT_FROM` (requires the `RESEND_API_KEY` secret; without it deliveries record `email_not_configured`). Abuse guards: 300s cooldown floor per rule and a 50-emails/day cap per customer (test fires count). `action_secret` is rejected. |
 
 ### Webhook signature verification
 
