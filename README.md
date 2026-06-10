@@ -15,7 +15,6 @@ Cloudflare Worker that ingests anonymized telemetry from the [loopgain](https://
 | `/v1/stats` | GET | Bearer | 30-day aggregate stats (outcome counts, totals, distinct framework / loop_type / team values for filter dropdowns). |
 | `/v1/profiles` | GET | Bearer | Convergence-profile events. Optional `workload_id`, `since_hours`, `framework`, `loop_type`, `team` filters. |
 | `/v1/events` | GET | Bearer | Recent loop events. Optional `rollbacks_only=true` plus the same filter set. |
-| `/v1/calibration` | GET | Bearer | Converged loops with first-ETA-prediction snapshots (drives the ETA Accuracy panel). |
 | `/v1/event/:id` | GET | Bearer | Full detail for one event including per-iteration trajectories (drives Loop Detail scrubbing). |
 | `/v1/alerts/rules` | GET / POST | Bearer | List or create alert rules. |
 | `/v1/alerts/rules/:id` | PUT / DELETE | Bearer | Update or delete an alert rule. |
@@ -164,7 +163,7 @@ To rotate, run `scripts/rotate-token.mjs` (or issue a fresh token and null out t
 See [`schema.sql`](./schema.sql) for the full DDL. Five tables:
 
 - **`customers`** — `customer_id`, `token_hash` (SHA-256), `name`, `contact_email`, timestamps.
-- **`loop_events`** — one row per loop run. Columns mirror the telemetry payload across schema versions: outcome, iterations_used, gain_margin, savings, rollback flag, profile stats, threshold config, smoothing window, library_version, workload_id, timestamp_hour, received_at, plus the v2/v3 additions (eta snapshots, per-iteration JSON, framework / loop_type / team).
+- **`loop_events`** — one row per loop run. Columns mirror the telemetry payload: outcome, iterations_used, savings, rollback flag, profile stats, threshold config, smoothing window, library_version, workload_id, timestamp_hour, received_at, plus per-iteration JSON and framework / loop_type / team. (Legacy `gain_margin` and `first_eta_*` columns from schema v1–v3 are retained for back-compat but no longer written as of v4.)
 - **`alert_rules`** — per-customer rule definitions (enabled flag, predicate JSON, filter JSON, window seconds, cooldown).
 - **`alert_deliveries`** — append-only fire log used by the dashboard's alert audit view.
 - **`funnel_events`** — anonymous adoption-funnel events from `/v1/funnel` (`loopgain.funnel`). One row per event (`first_init` / `first_observe` / `session`): random `instance_id`, hour-bucketed `ts_hour`, library/python/os versions, adapter, session_seq, coarse outcome counts. **No `customer_id`, no token, no IP** — wholly separate from the product tables.
