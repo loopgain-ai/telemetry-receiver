@@ -2,7 +2,7 @@
 
 Cloudflare Worker that ingests anonymized telemetry from the [loopgain](https://github.com/loopgain-ai/loopgain) Python library and serves aggregated reads to the [LoopGain dashboard](https://github.com/loopgain-ai/dashboard).
 
-**Privacy contract** (enforced by the library at the source): only structural statistics are sent and stored — state transitions, Aβ summaries (min/max/median), rollback flag, library version, optional opaque `workload_id`, threshold config. Never prompts, completions, error contents, output buffers, or any per-iteration Aβ.
+**Privacy contract** (enforced by the library at the source): only structural statistics are sent and stored — state transitions, Aβ summaries (min/max/median), optional length-capped per-iteration trajectories (smoothed Aβ values + numeric error magnitudes), rollback flag, library version, optional opaque `workload_id`, threshold config. Never prompts, completions, error contents, or output buffers.
 
 ---
 
@@ -66,7 +66,7 @@ Rules without an `action_secret` are delivered unsigned. The secret is write-onl
 - **D1**: SQLite at the edge. Tables: `customers` (bearer-token → customer_id), `loop_events` (append-only event log), `alert_rules`, `alert_deliveries`.
 - **No application server.** Pre-scale, the operational footprint is one Worker + one D1 database.
 
-**Schema versions.** The receiver accepts payloads at schema v1, v2, and v3. v2 added `first_eta_prediction` + `first_eta_at_iteration`; v3 added per-iteration trajectory JSON plus optional `framework` / `loop_type` / `team` classification labels. Older payloads store NULL for newer fields.
+**Schema versions.** The receiver accepts payloads at schema v1 through v4 (current; library v0.5+ sends v4). v2 added ETA fields (discontinued in v4 — accepted but ignored); v3 added per-iteration trajectory JSON plus optional `framework` / `loop_type` / `team` classification labels; v4 dropped the discontinued ETA / gain-margin fields. Older payloads store NULL for newer fields.
 
 **Rate limiting.** Cloudflare first-party rate-limit bindings: per-IP across the authenticated routes (unauth abuse), per-customer on `/v1/aggregate` (ingestion ceiling), per-customer on read routes (dashboard polling ceiling), and a separate per-IP bucket on the unauthenticated `/v1/funnel` route so anonymous funnel traffic never touches the authed-route ceiling. CORS locked to `dashboard.loopgain.ai` plus a small set of localhost origins; `/v1/aggregate` does not accept browser-origin requests at all.
 
