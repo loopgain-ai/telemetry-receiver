@@ -794,20 +794,48 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
   if (!customerId) return json({ error: "unauthorized" }, 401);
   const rl = await env.READ_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
-  return statsCore(env, customerId);
+  const includeCalibration = new URL(request.url).searchParams.get("include_calibration") === "true";
+  return statsCore(env, customerId, includeCalibration);
 }
 
-async function statsCore(env: Env, customerId: string): Promise<Response> {
+// Reserved `team` value for runs that deliberately don't reflect real
+// production behaviour — e.g. a sampled run forced past its real stop
+// signal on purpose, to measure what the skipped work would have cost
+// (see loopgain-mdl's first-principles-lg calibration sampling). These
+// rows are real telemetry, kept forever, but excluded from the tenant's
+// headline aggregates by default so they don't skew "what LoopGain
+// actually saved me" — the same way the venture-advisor-rig's own
+// board-exclude.json keeps calibration runs out of the ranked board
+// while preserving their history. `/v1/events` and `/v1/profiles` still
+// surface them via the existing team= filter for anyone who wants to
+// inspect them directly.
+const CALIBRATION_TEAM = "calibration";
+
+async function statsCore(env: Env, customerId: string, includeCalibration: boolean): Promise<Response> {
   const since = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
+  // NULL-safe: plain `team != ?` would silently drop every row with no
+  // team set at all (SQL: NULL != 'x' is NULL, not true), which is most
+  // rows for most tenants — this must stay `(team IS NULL OR team != ?)`.
+  const calib = includeCalibration ? "" : "AND (team IS NULL OR team != ?)";
+  const calibBind = includeCalibration ? [] : [CALIBRATION_TEAM];
 
   const outcomeStats = await env.DB.prepare(
     `SELECT outcome, COUNT(*) AS count
        FROM loop_events
-       WHERE customer_id = ? AND timestamp_hour >= ?
+       WHERE customer_id = ? AND timestamp_hour >= ? ${calib}
        GROUP BY outcome`,
   )
-    .bind(customerId, since)
+    .bind(customerId, since, ...calibBind)
     .all();
+
+  const excludedCalibration = includeCalibration
+    ? { count: 0 }
+    : await env.DB.prepare(
+        `SELECT COUNT(*) AS count FROM loop_events
+           WHERE customer_id = ? AND timestamp_hour >= ? AND team = ?`,
+      )
+        .bind(customerId, since, CALIBRATION_TEAM)
+        .first<{ count: number }>();
 
   const totals = await env.DB.prepare(
     `SELECT COUNT(*) AS event_count,
@@ -825,20 +853,20 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
             COALESCE(SUM(CASE WHEN best_index IS NOT NULL THEN iterations_used - 1 - best_index ELSE 0 END), 0) AS total_iterations_past_best,
             SUM(CASE WHEN best_index = 0 THEN 1 ELSE 0 END) AS event_count_best_at_iter1
        FROM loop_events
-       WHERE customer_id = ? AND timestamp_hour >= ?`,
+       WHERE customer_id = ? AND timestamp_hour >= ? ${calib}`,
   )
-    .bind(customerId, since)
+    .bind(customerId, since, ...calibBind)
     .first();
 
   const workloadStats = await env.DB.prepare(
     `SELECT workload_id, COUNT(*) AS count
        FROM loop_events
-       WHERE customer_id = ? AND timestamp_hour >= ?
+       WHERE customer_id = ? AND timestamp_hour >= ? ${calib}
        GROUP BY workload_id
        ORDER BY count DESC
        LIMIT 5000`,
   )
-    .bind(customerId, since)
+    .bind(customerId, since, ...calibBind)
     .all();
 
   // v3: surface distinct classification values so the dashboard can
@@ -882,14 +910,14 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
                 COUNT(*) OVER () AS total
            FROM loop_events
           WHERE customer_id = ? AND timestamp_hour >= ?
-            AND ${column} IS NOT NULL
+            AND ${column} IS NOT NULL ${calib}
        )
        SELECT
          (SELECT AVG(v) FROM ordered WHERE rn IN ((total+1)/2, (total+2)/2)) AS median,
          (SELECT MIN(v) FROM ordered WHERE CAST(rn AS REAL)/total >= 0.99)  AS p99,
          (SELECT MIN(v) FROM ordered WHERE CAST(rn AS REAL)/total >= 0.10)  AS p10`,
     )
-      .bind(customerId, since)
+      .bind(customerId, since, ...calibBind)
       .first<{ median: number | null; p99: number | null; p10: number | null }>();
     return r;
   }
@@ -909,11 +937,11 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
             COALESCE(SUM(savings_vs_fixed_cap), 0) AS iterations_avoided,
             SUM(actual_dollars_saved) AS actual_dollars_saved
        FROM loop_events
-       WHERE customer_id = ? AND timestamp_hour >= ?
+       WHERE customer_id = ? AND timestamp_hour >= ? ${calib}
        GROUP BY outcome
        ORDER BY events DESC`,
   )
-    .bind(customerId, since)
+    .bind(customerId, since, ...calibBind)
     .all();
 
   return json({
@@ -932,6 +960,13 @@ async function statsCore(env: Env, customerId: string): Promise<Response> {
       ab_p99: abAgg?.p99 ?? null,
       by_outcome: byOutcome.results,
     },
+    // Calibration runs (team="calibration") deliberately don't reflect real
+    // production behaviour — see CALIBRATION_TEAM above — and are excluded
+    // from every number above by default. Never silently: this tells the
+    // caller how many were left out, and include_calibration=true opts back
+    // in (e.g. for inspecting the calibration sample itself).
+    calibration_excluded: includeCalibration ? 0 : (excludedCalibration?.count ?? 0),
+    calibration_included: includeCalibration,
   });
 }
 
@@ -1730,7 +1765,7 @@ async function handlePublicBenchmark(
   const tail = url.pathname.slice("/v1/public/benchmark/".length);
   // Strip query string from the routing decision; tail compares the path only.
   let inner: Response;
-  if (tail === "stats") inner = await statsCore(env, BENCH_CUSTOMER_ID);
+  if (tail === "stats") inner = await statsCore(env, BENCH_CUSTOMER_ID, false);
   else if (tail === "profiles") inner = await profilesCore(url, env, BENCH_CUSTOMER_ID);
   else if (tail === "events") inner = await eventsCore(url, env, BENCH_CUSTOMER_ID);
   else if (tail === "alerts/rules") inner = await alertRulesListCore(env, BENCH_CUSTOMER_ID);
