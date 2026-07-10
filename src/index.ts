@@ -1002,8 +1002,18 @@ async function statsCore(
     .bind(customerId, since, ...calibBind)
     .all();
 
+  // Tier rides along on /v1/stats (fetched by every panel) so the
+  // dashboard can render tier-appropriate UI — e.g. the alert rule
+  // editor's Team-upgrade panel — without a second endpoint. NULL for
+  // unclassified tenants and the public bench route.
+  const tierRow = await env.DB
+    .prepare(`SELECT tier FROM customers WHERE customer_id = ?`)
+    .bind(customerId)
+    .first<{ tier: string | null }>();
+
   return json({
     customer_id: customerId,
+    tier: tierRow?.tier ?? null,
     // null = all-time (public bench route); 30 = the rolling authed window.
     window_days: since === 0 ? null : 30,
     since,
@@ -1608,6 +1618,40 @@ function ruleRowToWire(row: AlertRuleRow): Record<string, unknown> {
   };
 }
 
+// ── Alert tier gating ──────────────────────────────────────────────────
+//
+// Alerts (Slack/email/webhook delivery) are sold on the Team tier. The
+// gate covers WRITE verbs only — create, update, test:
+//   - GET rules / GET deliveries stay open (see what exists),
+//   - DELETE stays open (never trap a downgraded user with an
+//     un-deletable firing rule),
+//   - the evaluation cron is unchanged (existing rules keep firing),
+//   - NULL/unknown tier is exempt — same conservative default as
+//     retention pruning and the daily cap (pre-tier design partners and
+//     the bench tenant keep today's behavior).
+async function getCustomerTier(env: Env, customerId: string): Promise<string | null> {
+  const row = await env.DB
+    .prepare(`SELECT tier FROM customers WHERE customer_id = ?`)
+    .bind(customerId)
+    .first<{ tier: string | null }>();
+  return row?.tier ?? null;
+}
+
+async function alertWriteTierGate(env: Env, customerId: string): Promise<Response | null> {
+  const tier = await getCustomerTier(env, customerId);
+  if (tier === "individual") {
+    return json(
+      {
+        error: "team_tier_required",
+        message:
+          "Alert rules are a Team-tier feature. Existing rules keep evaluating and can be deleted; creating, editing and testing rules requires an upgrade.",
+      },
+      403,
+    );
+  }
+  return null;
+}
+
 async function handleAlertRulesCollection(
   request: Request,
   env: Env,
@@ -1621,6 +1665,8 @@ async function handleAlertRulesCollection(
     return alertRulesListCore(env, customerId);
   }
   if (request.method === "POST") {
+    const gate = await alertWriteTierGate(env, customerId);
+    if (gate) return gate;
     const count = await env.DB
       .prepare(`SELECT COUNT(*) AS n FROM alert_rules WHERE customer_id = ?`)
       .bind(customerId)
@@ -1680,6 +1726,8 @@ async function handleAlertRuleItem(
   if (!Number.isInteger(id) || id <= 0) return json({ error: "invalid_rule_id" }, 400);
 
   if (request.method === "PUT") {
+    const gate = await alertWriteTierGate(env, customerId);
+    if (gate) return gate;
     let body: unknown;
     try {
       body = await request.json();
@@ -1753,6 +1801,9 @@ async function handleAlertRuleTest(
   if (!customerId) return json({ error: "unauthorized" }, 401);
   const rl = await env.READ_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
+
+  const gate = await alertWriteTierGate(env, customerId);
+  if (gate) return gate;
 
   const id = Number(idStr);
   if (!Number.isInteger(id) || id <= 0) return json({ error: "invalid_rule_id" }, 400);
