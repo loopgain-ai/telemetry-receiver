@@ -1123,7 +1123,8 @@ async function eventsCore(
     .prepare(
       `SELECT id, timestamp_hour, workload_id, framework, loop_type, team,
               outcome, iterations_used, profile_max,
-              savings_vs_fixed_cap, library_version, best_index
+              savings_vs_fixed_cap, library_version, best_index,
+              rollback_triggered, actual_dollars_saved, actual_dollars_spent
          FROM loop_events
          WHERE customer_id = ? AND timestamp_hour >= ?
            ${rollbackClause} ${filters.sql}
