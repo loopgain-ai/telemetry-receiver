@@ -174,6 +174,33 @@ interface TelemetryPayload {
 const SUPPORTED_SCHEMA_VERSIONS = [1, 2, 3, 4] as const;
 const CURRENT_SCHEMA_VERSION = 4;
 
+// ── Pricing tiers (customers.tier) ─────────────────────────────────────
+//
+// Free-tier daily ingestion ceiling for tier='individual'. Sized against
+// real bench data: LG loops converge/stop at a 1-2 iteration median
+// (loopgain-bench by_band.json), so a genuinely active solo dev is nowhere
+// near this. It exists to bound the case of a team routing load through
+// one free login, not to police the honest case — each account maxing out
+// at 300/day is a visible signal to upgrade, not a cost-recovery measure
+// (D1/Workers cost at this volume is a rounding error either way).
+// Distinct from AGGREGATE_RL, which is a flat per-minute anti-abuse
+// ceiling applied to every customer regardless of tier.
+const INDIVIDUAL_DAILY_EVENT_CAP = 300;
+
+// Retention window per tier, applied by the scheduled cron's
+// pruneExpiredLoopEvents(). `null` means never auto-pruned:
+//   - 'enterprise' retention is a negotiated contract term, not a code default.
+//   - Missing/unrecognized tier values are treated the same as `null` below
+//     (see pruneExpiredLoopEvents) — conservative by construction.
+// Three tiers only (2026-07-08: the 'pro' tier was collapsed pre-launch,
+// zero real customers affected — its retention/feature set split between
+// 'team' and 'enterprise'; see ADR-0017).
+const RETENTION_DAYS_BY_TIER: Record<string, number | null> = {
+  individual: 7,
+  team: 30,
+  enterprise: null,
+};
+
 // Defensive cap on per-iteration arrays at the receiver. The library caps at
 // 256 before transmission; mirroring it here protects against malformed or
 // hand-crafted payloads that try to write very large blobs.
@@ -376,9 +403,30 @@ async function handleAggregate(request: Request, env: Env): Promise<Response> {
   const customerId = await authenticate(request, env);
   if (!customerId) return json({ error: "unauthorized" }, 401);
 
-  // Per-customer ingestion ceiling.
+  // Per-customer ingestion ceiling (flat anti-abuse limit, all tiers).
   const rl = await env.AGGREGATE_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
+
+  // Free-tier daily ingestion cap. Excludes the internal bench tenant
+  // outright (it legitimately re-uploads 2,000+ trials at a time via
+  // upload_to_dashboard.py) rather than relying on its tier staying unset.
+  if (customerId !== BENCH_CUSTOMER_ID) {
+    const tierRow = await env.DB.prepare(
+      `SELECT c.tier AS tier,
+              (SELECT COUNT(*) FROM loop_events le
+                 WHERE le.customer_id = c.customer_id AND le.received_at >= ?1) AS events_today
+         FROM customers c WHERE c.customer_id = ?2`,
+    )
+      .bind(Math.floor(Date.now() / 1000) - 86400, customerId)
+      .first<{ tier: string | null; events_today: number }>();
+
+    if (tierRow?.tier === "individual" && tierRow.events_today >= INDIVIDUAL_DAILY_EVENT_CAP) {
+      return json(
+        { error: "daily_cap_reached", tier: "individual", cap: INDIVIDUAL_DAILY_EVENT_CAP },
+        429,
+      );
+    }
+  }
 
   // Body-size cap. Fail fast before parsing JSON so a malformed-but-huge
   // body doesn't burn CPU. Cloudflare's own ~100 MB ceiling is the only
@@ -811,8 +859,18 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
 // inspect them directly.
 const CALIBRATION_TEAM = "calibration";
 
-async function statsCore(env: Env, customerId: string, includeCalibration: boolean): Promise<Response> {
-  const since = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
+async function statsCore(
+  env: Env,
+  customerId: string,
+  includeCalibration: boolean,
+  // Epoch-seconds floor for the window. Defaults to the rolling 30-day
+  // window every authed read uses. The public benchmark route passes 0
+  // (all-time): the bench tenant is a static, fixed-timestamp dataset, and
+  // a rolling window silently empties once the upload ages past it — the
+  // /demo and /benchmark pages went all-zeros on 2026-07-03 exactly this way.
+  sinceEpoch?: number,
+): Promise<Response> {
+  const since = sinceEpoch ?? Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
   // NULL-safe: plain `team != ?` would silently drop every row with no
   // team set at all (SQL: NULL != 'x' is NULL, not true), which is most
   // rows for most tenants — this must stay `(team IS NULL OR team != ?)`.
@@ -946,7 +1004,8 @@ async function statsCore(env: Env, customerId: string, includeCalibration: boole
 
   return json({
     customer_id: customerId,
-    window_days: 30,
+    // null = all-time (public bench route); 30 = the rolling authed window.
+    window_days: since === 0 ? null : 30,
     since,
     outcomes: outcomeStats.results,
     totals,
@@ -985,11 +1044,14 @@ async function profilesCore(
   url: URL,
   env: Env,
   customerId: string,
+  // Same contract as statsCore.sinceEpoch: 0 = all-time (public bench).
+  sinceEpoch?: number,
 ): Promise<Response> {
   const sinceParam = url.searchParams.get("since_hours");
   const since =
+    sinceEpoch ??
     Math.floor(Date.now() / 1000) -
-    (sinceParam ? parseInt(sinceParam, 10) * 3600 : 30 * 24 * 3600);
+      (sinceParam ? parseInt(sinceParam, 10) * 3600 : 30 * 24 * 3600);
 
   // workload_id is one of the classification filters; the helper applies it
   // along with framework/loop_type/team. id is included so the dashboard can
@@ -1030,9 +1092,19 @@ async function eventsCore(
   url: URL,
   env: Env,
   customerId: string,
+  // Same contract as statsCore.sinceEpoch: 0 = all-time (public bench).
+  sinceEpoch?: number,
 ): Promise<Response> {
   const rollbacksOnly = url.searchParams.get("rollbacks_only") === "true";
-  const since = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
+  // Honor since_hours like profilesCore does (the dashboard sends it on
+  // /v1/events too; ignoring it here was a silent mismatch).
+  const sinceParam = parseInt(url.searchParams.get("since_hours") ?? "", 10);
+  const since =
+    sinceEpoch ??
+    Math.floor(Date.now() / 1000) -
+      (Number.isFinite(sinceParam) && sinceParam > 0
+        ? sinceParam * 3600
+        : 30 * 24 * 3600);
 
   const filters = classificationFilters(url);
   const rollbackClause = rollbacksOnly ? "AND rollback_triggered = 1" : "";
@@ -1238,10 +1310,41 @@ export default {
   // Scheduled cron handler — evaluates every enabled alert_rule and fires
   // the rule's delivery channel (webhook / slack / email) on match. Runs
   // every minute (see wrangler.toml).
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(evaluateAlertRules(env));
+    // Retention pruning runs on the same per-minute trigger but only does
+    // work once an hour (minute 0) — the cutoff only needs hour-granularity
+    // and this keeps the D1 write load 60x lower than running it every tick.
+    if (new Date(event.scheduledTime).getUTCMinutes() === 0) {
+      ctx.waitUntil(pruneExpiredLoopEvents(env));
+    }
   },
 };
+
+// ── Retention pruning ─────────────────────────────────────────────────
+//
+// Deletes loop_events past each tier's retention window (see
+// RETENTION_DAYS_BY_TIER). Tiers with a `null` window, and any customer
+// whose tier is unset or unrecognized, are never auto-pruned — this is
+// deliberately conservative since existing customers (design partners,
+// the bench tenant) predate the tier column and default to NULL. The
+// bench tenant is additionally excluded by customer_id outright, the same
+// belt-and-suspenders guard used in handleAggregate.
+async function pruneExpiredLoopEvents(env: Env): Promise<void> {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  for (const [tier, days] of Object.entries(RETENTION_DAYS_BY_TIER)) {
+    if (days === null) continue;
+    const cutoff = nowSeconds - days * 86400;
+    await env.DB.prepare(
+      `DELETE FROM loop_events
+         WHERE received_at < ?1
+           AND customer_id != ?2
+           AND customer_id IN (SELECT customer_id FROM customers WHERE tier = ?3)`,
+    )
+      .bind(cutoff, BENCH_CUSTOMER_ID, tier)
+      .run();
+  }
+}
 
 // ── Alert subsystem ───────────────────────────────────────────────────
 
@@ -1765,9 +1868,14 @@ async function handlePublicBenchmark(
   const tail = url.pathname.slice("/v1/public/benchmark/".length);
   // Strip query string from the routing decision; tail compares the path only.
   let inner: Response;
-  if (tail === "stats") inner = await statsCore(env, BENCH_CUSTOMER_ID, false);
-  else if (tail === "profiles") inner = await profilesCore(url, env, BENCH_CUSTOMER_ID);
-  else if (tail === "events") inner = await eventsCore(url, env, BENCH_CUSTOMER_ID);
+  // All three data routes read the bench tenant ALL-TIME (sinceEpoch 0).
+  // The bench dataset is a static artifact with fixed upload timestamps;
+  // the rolling 30-day window the authed routes use emptied these pages
+  // once the 2026-06-03 upload aged out (all-zeros /demo + /benchmark,
+  // caught 2026-07-09).
+  if (tail === "stats") inner = await statsCore(env, BENCH_CUSTOMER_ID, false, 0);
+  else if (tail === "profiles") inner = await profilesCore(url, env, BENCH_CUSTOMER_ID, 0);
+  else if (tail === "events") inner = await eventsCore(url, env, BENCH_CUSTOMER_ID, 0);
   else if (tail === "alerts/rules") inner = await alertRulesListCore(env, BENCH_CUSTOMER_ID);
   else if (tail === "alerts/deliveries") inner = await alertDeliveriesCore(env, BENCH_CUSTOMER_ID);
   else if (tail.startsWith("event/")) {

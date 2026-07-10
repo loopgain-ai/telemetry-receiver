@@ -24,6 +24,13 @@
 --                       OSS library's loopgain.funnel module (POST /v1/funnel).
 --                       Entirely separate from loop_events: no customer_id,
 --                       no bearer token, no IP. See migration 0007.
+--   v4.1 (2026-07-08) — added customers.tier ('individual' | 'team' |
+--                       'enterprise' | NULL). Drives the free-tier daily
+--                       ingestion cap (handleAggregate) and per-tier
+--                       retention pruning (scheduled cron). NULL = unclassified,
+--                       exempt from both. See migration 0009. (The 'pro' tier
+--                       was collapsed into team/enterprise before launch,
+--                       zero customers affected — see ADR-0017.)
 
 -- Customers and their bearer tokens.
 -- token_hash is the SHA-256 hex digest of the bearer token. The plain token
@@ -34,7 +41,11 @@ CREATE TABLE IF NOT EXISTS customers (
     name TEXT,
     contact_email TEXT,
     created_at INTEGER NOT NULL,
-    last_seen_at INTEGER
+    last_seen_at INTEGER,
+    -- v4.1: pricing tier ('individual' | 'team' | 'enterprise' | NULL).
+    -- NULL = unclassified (no cap, no auto-prune).
+    -- See INDIVIDUAL_DAILY_EVENT_CAP and RETENTION_DAYS_BY_TIER in src/index.ts.
+    tier TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_customers_token_hash

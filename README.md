@@ -145,16 +145,21 @@ Tokens are issued via a one-liner. The plain token is printed once; only its SHA
 
 ```bash
 # Production:
-npm run issue-token -- --name "ACME Corp" --email "ops@acme.com"
+npm run issue-token -- --name "ACME Corp" --email "ops@acme.com" --tier team
 
 # Local (against local D1):
-npm run issue-token -- --name "test-account" --local
+npm run issue-token -- --name "test-account" --tier individual --local
 ```
+
+`--tier` is one of `individual` | `team` | `enterprise`. Omitting it
+provisions the customer unclassified (tier `NULL`) — exempt from both the
+free-tier daily cap and retention pruning below, until a tier is assigned.
 
 Output:
 
 ```
 Customer ID:  cust_<16-hex-chars>
+Tier:         individual
 Bearer Token: lgk_<32-char-base64url>   # shown ONCE; never re-derivable
 ```
 
@@ -172,11 +177,39 @@ To rotate, run `scripts/rotate-token.mjs` (or issue a fresh token and null out t
 
 ---
 
+## Tiers, retention & the free-tier cap
+
+Three tiers, tracked in `customers.tier`:
+
+| Tier | Retention | Daily ingestion cap |
+|---|---|---|
+| `individual` (free) | 7 days | 300 events/day (`INDIVIDUAL_DAILY_EVENT_CAP` in `src/index.ts`) |
+| `team` ($199/mo) | 30 days | none beyond `AGGREGATE_RL` |
+| `enterprise` (custom) | negotiated, never auto-pruned | none beyond `AGGREGATE_RL` |
+| unset (`NULL`) | never auto-pruned | none — legacy/unclassified customers keep today's unlimited behavior |
+
+(A fourth `pro` tier was scoped in the initial design but collapsed pre-launch — zero real customers existed yet, so there was nothing to migrate. Its features split between `team` and `enterprise`; see ADR-0017.)
+
+The daily cap is a distinct mechanism from `AGGREGATE_RL` (a flat per-minute
+anti-abuse ceiling applied to every customer regardless of tier, see
+`wrangler.toml`). It exists to bound the case of a team routing volume
+through one free `individual` login — 300/day is sized well above real
+solo-dev loop volume (bench data: LG loops converge/stop at a 1–2 iteration
+median), so an honest user never notices it; a team spread across several
+free accounts hits the ceiling on each one instead.
+
+Retention is enforced by `pruneExpiredLoopEvents()`, run from the existing
+per-minute `scheduled` cron once an hour (see `wrangler.toml`'s
+`[triggers]`). The internal bench tenant (`BENCH_CUSTOMER_ID`) is excluded
+from both the cap and pruning by customer_id, independent of its tier.
+
+---
+
 ## Schema
 
 See [`schema.sql`](./schema.sql) for the full DDL. Five tables:
 
-- **`customers`** — `customer_id`, `token_hash` (SHA-256), `name`, `contact_email`, timestamps.
+- **`customers`** — `customer_id`, `token_hash` (SHA-256), `name`, `contact_email`, timestamps, `tier` (`individual`/`team`/`pro`/`enterprise`/`NULL` — see "Tiers, retention & the free-tier cap" above).
 - **`loop_events`** — one row per loop run. Columns mirror the telemetry payload: outcome, iterations_used, savings, rollback flag, profile stats, threshold config, smoothing window, library_version, workload_id, timestamp_hour, received_at, plus per-iteration JSON and framework / loop_type / team. (Legacy `gain_margin` and `first_eta_*` columns from schema v1–v3 are retained for back-compat but no longer written as of v4.)
 - **`alert_rules`** — per-customer rule definitions (enabled flag, predicate JSON, filter JSON, window seconds, cooldown).
 - **`alert_deliveries`** — append-only fire log used by the dashboard's alert audit view.

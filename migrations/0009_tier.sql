@@ -1,0 +1,21 @@
+-- Migration 0009 — tier (schema v4.1)
+--
+-- Classifies each customer into a pricing tier so the receiver can apply
+-- per-tier retention windows and the free-tier daily ingestion cap.
+-- Three tiers (the 'pro' tier was collapsed into team/enterprise before
+-- launch — see ADR-0017 — so it never appears here):
+--   'individual' — free hosted dashboard, single-user. 7-day retention,
+--                  300 events/day ingestion cap (see INDIVIDUAL_DAILY_EVENT_CAP
+--                  in src/index.ts).
+--   'team'       — $199/mo. 30-day retention, no app-level daily cap beyond
+--                  the existing AGGREGATE_RL anti-abuse ceiling.
+--   'enterprise' — negotiated per deal. No auto-prune (retention is a
+--                  contract term, not a code default).
+--
+-- NULL (the default for every pre-existing row) means "unclassified" —
+-- exempt from both the daily cap and retention pruning. This is
+-- deliberately conservative: existing customers (design partners, the
+-- bench tenant) keep today's unlimited behavior until someone explicitly
+-- assigns a tier via `UPDATE customers SET tier = ... WHERE customer_id = ...`
+-- or a fresh `issue-token.mjs --tier ...` provisioning.
+ALTER TABLE customers ADD COLUMN tier TEXT;
