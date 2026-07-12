@@ -858,10 +858,24 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
 // headline aggregates by default so they don't skew "what LoopGain
 // actually saved me" — the same way the venture-advisor-rig's own
 // board-exclude.json keeps calibration runs out of the ranked board
-// while preserving their history. `/v1/events` and `/v1/profiles` still
-// surface them via the existing team= filter for anyone who wants to
-// inspect them directly.
+// while preserving their history. `/v1/events` and `/v1/profiles` apply
+// the SAME default exclusion as /v1/stats (since 2026-07-11): the
+// dashboard computes percentages from the events sample, and a
+// different default there gave two denominators for the same metric
+// (83.2% fleet vs 82.3% sample, seen live). Opt back in with
+// include_calibration=true, or by filtering team=calibration directly.
 const CALIBRATION_TEAM = "calibration";
+
+// Default-exclude calibration rows, mirroring statsCore. An explicit
+// team= filter is an implicit opt-in: the caller named the rows they
+// want (team=calibration would otherwise be self-contradictory).
+function calibrationExclusion(url: URL): { sql: string; binds: string[] } {
+  const optIn =
+    url.searchParams.get("include_calibration") === "true" ||
+    url.searchParams.get("team") !== null;
+  if (optIn) return { sql: "", binds: [] };
+  return { sql: "AND (team IS NULL OR team != ?)", binds: [CALIBRATION_TEAM] };
+}
 
 async function statsCore(
   env: Env,
@@ -1071,17 +1085,18 @@ async function profilesCore(
   // along with framework/loop_type/team. id is included so the dashboard can
   // open Loop Detail without re-deriving from (workload_id, timestamp_hour).
   const filters = classificationFilters(url);
+  const calib = calibrationExclusion(url);
   const limit = parseRowLimit(url);
   const result = await env.DB.prepare(
     `SELECT id, timestamp_hour, workload_id, framework, loop_type, team,
             profile_min, profile_max, profile_median, profile_samples,
             outcome, iterations_used
        FROM loop_events
-       WHERE customer_id = ? AND timestamp_hour >= ? ${filters.sql}
+       WHERE customer_id = ? AND timestamp_hour >= ? ${calib.sql} ${filters.sql}
        ORDER BY timestamp_hour DESC
        LIMIT ?`,
   )
-    .bind(customerId, since, ...filters.binds, limit)
+    .bind(customerId, since, ...calib.binds, ...filters.binds, limit)
     .all();
 
   return json({
@@ -1121,6 +1136,7 @@ async function eventsCore(
         : 30 * 24 * 3600);
 
   const filters = classificationFilters(url);
+  const calib = calibrationExclusion(url);
   const rollbackClause = rollbacksOnly ? "AND rollback_triggered = 1" : "";
   const limit = parseRowLimit(url);
   const result = await env.DB
@@ -1131,11 +1147,11 @@ async function eventsCore(
               rollback_triggered, actual_dollars_saved, actual_dollars_spent
          FROM loop_events
          WHERE customer_id = ? AND timestamp_hour >= ?
-           ${rollbackClause} ${filters.sql}
+           ${calib.sql} ${rollbackClause} ${filters.sql}
          ORDER BY timestamp_hour DESC
          LIMIT ?`,
     )
-    .bind(customerId, since, ...filters.binds, limit)
+    .bind(customerId, since, ...calib.binds, ...filters.binds, limit)
     .all();
   return json({ customer_id: customerId, events: result.results });
 }
