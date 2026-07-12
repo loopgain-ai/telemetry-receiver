@@ -846,8 +846,13 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
   if (!customerId) return json({ error: "unauthorized" }, 401);
   const rl = await env.READ_RL.limit({ key: customerId });
   if (!rl.success) return json({ error: "rate_limited" }, 429);
-  const includeCalibration = new URL(request.url).searchParams.get("include_calibration") === "true";
-  return statsCore(env, customerId, includeCalibration);
+  const url = new URL(request.url);
+  // team= is an implicit calibration opt-in, same as calibrationExclusion:
+  // filtering team=calibration must not be self-contradictory.
+  const includeCalibration =
+    url.searchParams.get("include_calibration") === "true" ||
+    url.searchParams.get("team") !== null;
+  return statsCore(env, customerId, includeCalibration, undefined, classificationFilters(url));
 }
 
 // Reserved `team` value for runs that deliberately don't reflect real
@@ -887,6 +892,14 @@ async function statsCore(
   // a rolling window silently empties once the upload ages past it — the
   // /demo and /benchmark pages went all-zeros on 2026-07-03 exactly this way.
   sinceEpoch?: number,
+  // Classification filters (framework / loop_type / team / workload_id),
+  // applied to EVERY query uniformly — including the dropdown option lists.
+  // Before 2026-07-12 /v1/stats accepted none, so with a FilterBar filter
+  // active the dashboard's hero/gauge/KPI numbers stayed tenant-wide while
+  // every /v1/events-derived chart moved — and demo mode (which recomputes
+  // stats client-side over the FILTERED prefix) had the opposite semantics.
+  // The dashboard's pickers use a deliberately unfiltered fetch.
+  classification: { sql: string; binds: string[] } = { sql: "", binds: [] },
 ): Promise<Response> {
   const since = sinceEpoch ?? Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
   // NULL-safe: plain `team != ?` would silently drop every row with no
@@ -894,23 +907,25 @@ async function statsCore(
   // rows for most tenants — this must stay `(team IS NULL OR team != ?)`.
   const calib = includeCalibration ? "" : "AND (team IS NULL OR team != ?)";
   const calibBind = includeCalibration ? [] : [CALIBRATION_TEAM];
+  const cls = classification.sql;
+  const clsBind = classification.binds;
 
   const outcomeStats = await env.DB.prepare(
     `SELECT outcome, COUNT(*) AS count
        FROM loop_events
-       WHERE customer_id = ? AND timestamp_hour >= ? ${calib}
+       WHERE customer_id = ? AND timestamp_hour >= ? ${calib} ${cls}
        GROUP BY outcome`,
   )
-    .bind(customerId, since, ...calibBind)
+    .bind(customerId, since, ...calibBind, ...clsBind)
     .all();
 
   const excludedCalibration = includeCalibration
     ? { count: 0 }
     : await env.DB.prepare(
         `SELECT COUNT(*) AS count FROM loop_events
-           WHERE customer_id = ? AND timestamp_hour >= ? AND team = ?`,
+           WHERE customer_id = ? AND timestamp_hour >= ? AND team = ? ${cls}`,
       )
-        .bind(customerId, since, CALIBRATION_TEAM)
+        .bind(customerId, since, CALIBRATION_TEAM, ...clsBind)
         .first<{ count: number }>();
 
   const totals = await env.DB.prepare(
@@ -922,6 +937,10 @@ async function statsCore(
             SUM(CASE WHEN actual_dollars_saved IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_savings,
             SUM(actual_dollars_spent) AS total_actual_dollars_spent,
             SUM(CASE WHEN actual_dollars_spent IS NOT NULL THEN 1 ELSE 0 END) AS event_count_with_actual_spend,
+            -- Iterations covered by measured dollars — lets the dashboard
+            -- extrapolate ONLY the uncovered remainder instead of treating a
+            -- partial SUM(actual_dollars_spent) as fleet-wide spend.
+            COALESCE(SUM(CASE WHEN actual_dollars_spent IS NOT NULL THEN iterations_used ELSE 0 END), 0) AS total_iterations_with_actual_spend,
             -- Iteration Waste aggregates (best_index = 0-based lowest-error iter).
             -- iterations-past-best = iterations_used-1-best_index is the grind a
             -- naive cap runs after the best output; LoopGain stops near best.
@@ -929,20 +948,20 @@ async function statsCore(
             COALESCE(SUM(CASE WHEN best_index IS NOT NULL THEN iterations_used - 1 - best_index ELSE 0 END), 0) AS total_iterations_past_best,
             SUM(CASE WHEN best_index = 0 THEN 1 ELSE 0 END) AS event_count_best_at_iter1
        FROM loop_events
-       WHERE customer_id = ? AND timestamp_hour >= ? ${calib}`,
+       WHERE customer_id = ? AND timestamp_hour >= ? ${calib} ${cls}`,
   )
-    .bind(customerId, since, ...calibBind)
+    .bind(customerId, since, ...calibBind, ...clsBind)
     .first();
 
   const workloadStats = await env.DB.prepare(
     `SELECT workload_id, COUNT(*) AS count
        FROM loop_events
-       WHERE customer_id = ? AND timestamp_hour >= ? ${calib}
+       WHERE customer_id = ? AND timestamp_hour >= ? ${calib} ${cls}
        GROUP BY workload_id
        ORDER BY count DESC
        LIMIT 5000`,
   )
-    .bind(customerId, since, ...calibBind)
+    .bind(customerId, since, ...calibBind, ...clsBind)
     .all();
 
   // v3: surface distinct classification values so the dashboard can
@@ -951,12 +970,12 @@ async function statsCore(
     const r = await env.DB.prepare(
       `SELECT ${column} AS value, COUNT(*) AS count
          FROM loop_events
-         WHERE customer_id = ? AND timestamp_hour >= ? AND ${column} IS NOT NULL
+         WHERE customer_id = ? AND timestamp_hour >= ? AND ${column} IS NOT NULL ${cls}
          GROUP BY ${column}
          ORDER BY count DESC
          LIMIT 50`,
     )
-      .bind(customerId, since)
+      .bind(customerId, since, ...clsBind)
       .all();
     return r.results;
   }
@@ -986,14 +1005,14 @@ async function statsCore(
                 COUNT(*) OVER () AS total
            FROM loop_events
           WHERE customer_id = ? AND timestamp_hour >= ?
-            AND ${column} IS NOT NULL ${calib}
+            AND ${column} IS NOT NULL ${calib} ${cls}
        )
        SELECT
          (SELECT AVG(v) FROM ordered WHERE rn IN ((total+1)/2, (total+2)/2)) AS median,
          (SELECT MIN(v) FROM ordered WHERE CAST(rn AS REAL)/total >= 0.99)  AS p99,
          (SELECT MIN(v) FROM ordered WHERE CAST(rn AS REAL)/total >= 0.10)  AS p10`,
     )
-      .bind(customerId, since, ...calibBind)
+      .bind(customerId, since, ...calibBind, ...clsBind)
       .first<{ median: number | null; p99: number | null; p10: number | null }>();
     return r;
   }
@@ -1013,11 +1032,11 @@ async function statsCore(
             COALESCE(SUM(savings_vs_fixed_cap), 0) AS iterations_avoided,
             SUM(actual_dollars_saved) AS actual_dollars_saved
        FROM loop_events
-       WHERE customer_id = ? AND timestamp_hour >= ? ${calib}
+       WHERE customer_id = ? AND timestamp_hour >= ? ${calib} ${cls}
        GROUP BY outcome
        ORDER BY events DESC`,
   )
-    .bind(customerId, since, ...calibBind)
+    .bind(customerId, since, ...calibBind, ...clsBind)
     .all();
 
   // Tier rides along on /v1/stats (fetched by every panel) so the
@@ -1945,7 +1964,7 @@ async function handlePublicBenchmark(
   // the rolling 30-day window the authed routes use emptied these pages
   // once the 2026-06-03 upload aged out (all-zeros /demo + /benchmark,
   // caught 2026-07-09).
-  if (tail === "stats") inner = await statsCore(env, BENCH_CUSTOMER_ID, false, 0);
+  if (tail === "stats") inner = await statsCore(env, BENCH_CUSTOMER_ID, false, 0, classificationFilters(url));
   else if (tail === "profiles") inner = await profilesCore(url, env, BENCH_CUSTOMER_ID, 0);
   else if (tail === "events") inner = await eventsCore(url, env, BENCH_CUSTOMER_ID, 0);
   else if (tail === "alerts/rules") inner = await alertRulesListCore(env, BENCH_CUSTOMER_ID);
