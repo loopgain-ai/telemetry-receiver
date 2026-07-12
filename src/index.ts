@@ -233,7 +233,11 @@ const ALLOWED_ORIGINS = new Set<string>([
 function corsHeaders(request: Request): Record<string, string> {
   const origin = request.headers.get("Origin") ?? "";
   const headers: Record<string, string> = {
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    // PUT/DELETE: alert-rule update (enable toggle, edit) and delete are
+    // called cross-origin from the dashboard — omitting them fails the
+    // browser preflight ("Method PUT is not allowed by
+    // Access-Control-Allow-Methods"), seen live 2026-07-11.
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Authorization, Content-Type",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
