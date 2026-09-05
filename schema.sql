@@ -210,3 +210,12 @@ CREATE INDEX IF NOT EXISTS idx_funnel_events_event_ts
 -- Group an install's events together (per-install funnel + retention).
 CREATE INDEX IF NOT EXISTS idx_funnel_events_instance
     ON funnel_events (instance_id);
+
+-- Independent of mutable rules and delivery history. No client CRUD path.
+CREATE TABLE IF NOT EXISTS email_quota_reservations (
+    id TEXT PRIMARY KEY NOT NULL,
+    customer_id TEXT NOT NULL,
+    reserved_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_email_quota_customer_time
+    ON email_quota_reservations (customer_id, reserved_at);
