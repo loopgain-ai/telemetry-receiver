@@ -1660,6 +1660,28 @@ function ruleRowToWire(row: AlertRuleRow): Record<string, unknown> {
   };
 }
 
+// Explicit public projection: never inherit destination fields from the
+// authenticated serializer, including future additions to that response.
+function publicRuleRowToWire(row: AlertRuleRow): Record<string, unknown> {
+  return {
+    id: row.id, name: row.name, enabled: row.enabled === 1,
+    predicate: JSON.parse(row.predicate), filter: row.filter ? JSON.parse(row.filter) : null,
+    window_seconds: row.window_seconds, cooldown_seconds: row.cooldown_seconds,
+    action_type: row.action_type, created_at: row.created_at,
+    updated_at: row.updated_at, last_fired_at: row.last_fired_at,
+  };
+}
+
+function publicDeliveryToWire(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: row.id, rule_id: row.rule_id, fired_at: row.fired_at,
+    match_value: row.match_value, match_count: row.match_count,
+    delivery_status: row.delivery_status, delivery_status_code: row.delivery_status_code,
+    rule_name: row.rule_name,
+    // Raw transport diagnostics can embed a configured destination URL.
+  };
+}
+
 // ── Alert tier gating ──────────────────────────────────────────────────
 //
 // Alerts (Slack/email/webhook delivery) are sold on the Team tier. The
@@ -1895,6 +1917,7 @@ async function handleAlertRuleTest(
 async function alertRulesListCore(
   env: Env,
   customerId: string,
+  publicView = false,
 ): Promise<Response> {
   const result = await env.DB
     .prepare(
@@ -1907,7 +1930,7 @@ async function alertRulesListCore(
     )
     .bind(customerId)
     .all<AlertRuleRow>();
-  return json({ rules: (result.results ?? []).map(ruleRowToWire) });
+  return json({ rules: (result.results ?? []).map(publicView ? publicRuleRowToWire : ruleRowToWire) });
 }
 
 async function handleAlertDeliveries(request: Request, env: Env): Promise<Response> {
@@ -1922,6 +1945,7 @@ async function handleAlertDeliveries(request: Request, env: Env): Promise<Respon
 async function alertDeliveriesCore(
   env: Env,
   customerId: string,
+  publicView = false,
 ): Promise<Response> {
   const result = await env.DB
     .prepare(
@@ -1936,7 +1960,7 @@ async function alertDeliveriesCore(
     )
     .bind(customerId)
     .all();
-  return json({ deliveries: result.results });
+  return json({ deliveries: publicView ? (result.results ?? []).map(publicDeliveryToWire) : result.results });
 }
 
 // ── Public benchmark routes ──────────────────────────────────────────
@@ -1969,8 +1993,8 @@ async function handlePublicBenchmark(
   if (tail === "stats") inner = await statsCore(env, BENCH_CUSTOMER_ID, false, 0, classificationFilters(url));
   else if (tail === "profiles") inner = await profilesCore(url, env, BENCH_CUSTOMER_ID, 0);
   else if (tail === "events") inner = await eventsCore(url, env, BENCH_CUSTOMER_ID, 0);
-  else if (tail === "alerts/rules") inner = await alertRulesListCore(env, BENCH_CUSTOMER_ID);
-  else if (tail === "alerts/deliveries") inner = await alertDeliveriesCore(env, BENCH_CUSTOMER_ID);
+  else if (tail === "alerts/rules") inner = await alertRulesListCore(env, BENCH_CUSTOMER_ID, true);
+  else if (tail === "alerts/deliveries") inner = await alertDeliveriesCore(env, BENCH_CUSTOMER_ID, true);
   else if (tail.startsWith("event/")) {
     const idStr = tail.slice("event/".length);
     inner = await eventDetailCore(env, BENCH_CUSTOMER_ID, idStr);

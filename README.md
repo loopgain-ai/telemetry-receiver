@@ -264,3 +264,14 @@ retention procedure; do not reset live customer usage when editing rules.
 Offline regression tests: Node 22.14+ and `npm test`. Tests use local SQLite,
 competing database connections, and a mocked email transport. `npm run typecheck`
 checks the Worker types. No test sends email or contacts a live database.
+
+### Public benchmark alert privacy
+
+Public benchmark rule responses expose rule metadata and channel type, but omit
+configured destination URLs/email addresses and signing secrets. Public delivery
+responses omit raw transport diagnostics, which can contain a destination URL.
+Authenticated customer responses retain their existing destination and diagnostic
+fields; signing secrets remain write-only. Use synthetic destinations for demo
+rules. Previously cached responses may remain available for up to five minutes;
+review and rotate any real destination credentials previously configured in the
+public demo tenant through a separately approved operational procedure.
