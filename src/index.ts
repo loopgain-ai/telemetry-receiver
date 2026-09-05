@@ -1,3 +1,5 @@
+import { reserveEmailQuota } from "./email-quota";
+
 /**
  * LoopGain telemetry receiver.
  *
@@ -2262,7 +2264,7 @@ async function deliverSlack(
   });
 }
 
-async function deliverEmail(
+export async function deliverEmail(
   env: Env,
   rule: AlertRuleRow,
   result: EvaluationResult,
@@ -2276,22 +2278,10 @@ async function deliverEmail(
   if (!validateEmailAddress(rule.action_url)) {
     return { status: "failed", statusCode: null, error: "url_rejected:invalid_email_address" };
   }
-  // Per-customer daily cap across ALL email rules (sent + test_sent). The
-  // cooldown floor bounds per-rule frequency; this bounds the aggregate so
-  // 50 rules can't add up to an unbounded Resend bill or a spam vector.
-  const capRow = await env.DB
-    .prepare(
-      `SELECT COUNT(*) AS n
-         FROM alert_deliveries d
-         JOIN alert_rules r ON r.id = d.rule_id
-        WHERE d.customer_id = ?
-          AND d.fired_at >= ?
-          AND r.action_type = 'email'
-          AND d.delivery_status IN ('sent', 'test_sent')`,
-    )
-    .bind(rule.customer_id, firedAt - 86400)
-    .first<{ n: number }>();
-  if ((capRow?.n ?? 0) >= EMAIL_DAILY_CAP) {
+  // Reserve atomically before contacting the provider. Rule edits/deletion cannot
+  // change this ledger. Failed/ambiguous attempts keep their reservation.
+  const reservation = await reserveEmailQuota(env.DB, rule.customer_id, EMAIL_DAILY_CAP);
+  if (!reservation) {
     return { status: "failed", statusCode: null, error: "email_daily_cap_reached" };
   }
   const subject = test
@@ -2325,6 +2315,7 @@ async function deliverEmail(
   });
   return postWithRetry("https://api.resend.com/emails", body, {
     Authorization: `Bearer ${env.RESEND_API_KEY}`,
+    "Idempotency-Key": reservation,
     "Content-Type": "application/json",
     "User-Agent": "loopgain-alerts/1.0",
   });

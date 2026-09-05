@@ -235,3 +235,32 @@ lg.send_telemetry(
 ## License
 
 [Apache-2.0](LICENSE).
+
+### Email quota ledger (migration 0010)
+
+Email sends reserve one of 50 slots per customer in the rolling 24-hour window
+using a single atomic D1 statement. Test sends share the same allowance. Editing
+or deleting a rule still works normally but never deletes these reservations.
+Failed or ambiguous provider requests retain their slot; retries use the same
+[Resend idempotency key](https://resend.com/docs/dashboard/emails/idempotency-keys)
+to avoid duplicate messages. Unconfigured email and invalid addresses consume
+no slot. No recipient addresses or message contents are stored in the ledger.
+
+Before deploying this Worker, apply `migrations/0010_email_quota.sql` through the
+normal approved D1 migration procedure. A missing ledger fails closed before
+email dispatch. The migration is repeatable and conservatively backfills all
+retained successful deliveries from the last 24 hours, regardless of their
+rule's current channel. This can temporarily reduce email allowance for
+customers with recent webhook/Slack deliveries. Already-deleted delivery history
+cannot be reconstructed: to guarantee the cap across rollout, disable email
+sending for a full 24 hours before enabling the migrated Worker. Do not run an
+older Worker that omits reservations alongside the new one. This change does
+not deploy the Worker or migrate a live database.
+
+The ledger has no client write/delete API and is independent of rule IDs.
+Operators may remove reservations strictly older than 24 hours under a separate
+retention procedure; do not reset live customer usage when editing rules.
+
+Offline regression tests: Node 22.14+ and `npm test`. Tests use local SQLite,
+competing database connections, and a mocked email transport. `npm run typecheck`
+checks the Worker types. No test sends email or contacts a live database.
