@@ -179,13 +179,18 @@ To rotate, run `scripts/rotate-token.mjs` (or issue a fresh token and null out t
 
 ## Tiers, retention & the free-tier cap
 
-Three tiers, tracked in `customers.tier`:
+The public plans are **Individual (free)** and **Team (coming soon)**.
+[Contact us about Team](mailto:hello@loopgain.ai?subject=LoopGain%20Team%20interest)
+to discuss your team's needs. See the [current plans](https://loopgain.ai/#pricing).
+
+The backend values in `customers.tier` control retention and ingestion limits.
+`enterprise` remains a compatibility value in the receiver; it is not a public plan.
 
 | Tier | Retention | Daily ingestion cap |
 |---|---|---|
 | `individual` (free) | 7 days | 300 events/day (`INDIVIDUAL_DAILY_EVENT_CAP` in `src/index.ts`) |
-| `team` ($199/mo) | 30 days | none beyond `AGGREGATE_RL` |
-| `enterprise` (custom) | negotiated, never auto-pruned | none beyond `AGGREGATE_RL` |
+| `team` | 30 days | none beyond `AGGREGATE_RL` |
+| `enterprise` (compatibility) | never auto-pruned | none beyond `AGGREGATE_RL` |
 | unset (`NULL`) | never auto-pruned | none — legacy/unclassified customers keep today's unlimited behavior |
 
 (A fourth `pro` tier was scoped in the initial design but collapsed pre-launch — zero real customers existed yet, so there was nothing to migrate. Its features split between `team` and `enterprise`; see ADR-0017.)
