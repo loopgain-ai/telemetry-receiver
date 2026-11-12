@@ -8,3 +8,6 @@ dist/
 
 # planning/brainstorm session briefs — never commit
 *KICKOFF.md
+
+# Claude Code per-machine settings (sandbox config, local allow rules)
+.claude/settings.local.json

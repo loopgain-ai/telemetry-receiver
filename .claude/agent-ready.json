@@ -1,0 +1,8 @@
+{
+  "test_quick": "npm test",
+  "test_full": "npm run typecheck && npm test",
+  "ci_local": "scripts/ci-local.sh",
+  "max_retries": 3,
+  "test_timeout_seconds": 900,
+  "ci_timeout_seconds": 1800
+}
